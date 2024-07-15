@@ -307,6 +307,7 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         """
         # pick next batch from scheduler
         batched_requests = self.scheduler.get_next_batch_and_pop()
+        # print(len(batched_requests))
         if len(batched_requests) == 0:
             # Two cases may cause len(batched_requests) == 0:
             # 1. No request in the waiting queue
@@ -325,10 +326,11 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                     request.request_id,
                     LifetimeEvent(LifetimeEventType.ContextBegin)
                 )
-                
             # push the batch into pipeline
             batched_requests.start_one_iteration(time.time())
+            tokens_per_batch = batched_requests.requests[0].prompt_token_ids.__len__()
             self.batches_in_pipeline.append(batched_requests)
+            
             remote_calls = self._remote_call_all_workers_async(
                 "step",
                 batched_requests.get_request_ids(),
@@ -353,8 +355,30 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 self.batches_ret_futures.pop(0)
             else:
                 generated_tokens_ids = await self.batches_ret_futures[0]
+                
+                
+                
                     
                 end_time = time.time()
+                latency = (end_time - batched_requests.start_time) * 1e3
+                d = self.model_config.hf_config.hidden_size
+                l = self.model_config.hf_config.num_hidden_layers
+                batch_size = len(batched_requests.requests)
+                ffn_h = self.model_config.hf_config.ffn_dim
+                h_scale = ffn_h / d
+                
+                bld = 1 * l * d
+                prefill_flops = 0
+                total_tokens = batched_requests.get_num_input_tokens()
+                for req in batched_requests.requests:
+                    s = req.get_num_input_tokens()
+                    prefill_flops += ((4 * s ** 2) + (8 + 4 * h_scale) * s * d) * bld
+                pp = self.parallel_config.pipeline_parallel_size
+                tp = self.parallel_config.tensor_parallel_size
+                Prefill_TflopS = prefill_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
+                P_mfu =  Prefill_TflopS / 312
+                logger.info("promt run : tokens %d, batch %s, latency %s ms,  p_mfu %f, prefill_flops %f, pp %s, tp %s", total_tokens, batch_size, latency, P_mfu, prefill_flops, pp, tp)
+       
                 generated_tokens = []
                 for gen_token_id in generated_tokens_ids:
                     try:
@@ -599,6 +623,27 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             else:
                 generated_tokens_ids = await self.batches_ret_futures[0]
                 end_time = time.time()
+                latency = (end_time - batched_requests.start_time) * 1e3
+                
+                latency = (end_time - batched_requests.start_time) * 1e3
+                d = self.model_config.hf_config.hidden_size
+                l = self.model_config.hf_config.num_hidden_layers
+                batch_size = len(batched_requests.requests)
+                ffn_h = self.model_config.hf_config.ffn_dim
+                h_scale = ffn_h / d
+                
+                bld = 1 * l * d
+                decode_flops = 0
+                total_tokens = batch_size
+                for req in batched_requests.requests:
+                    s = req.get_kvcache_slots()
+                    decode_flops += (4 * s + (8 + 4 * h_scale) * 1 * d) * bld
+
+                pp = self.parallel_config.pipeline_parallel_size
+                tp = self.parallel_config.tensor_parallel_size
+                Decode_TflopS = decode_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
+                P_mfu =  Decode_TflopS / 312
+                logger.info("decode run : tokens %d, batch %s, latency %s ms,  p_mfu %f, decode_flops %f, pp %s , tp %s", total_tokens, batch_size, latency, P_mfu, decode_flops, pp, tp)
                 generated_tokens = []
                 for gen_token_id in generated_tokens_ids:
                     try:

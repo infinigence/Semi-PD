@@ -27,7 +27,14 @@ def sample_requests(dataset_path: str, num_prompts: int) -> List[TestRequest]:
         raise ValueError(
             f"Number of prompts ({num_prompts}) is larger than the dataset size ({len(dataset.reqs)})."
         )
-    return random.sample(dataset.reqs, num_prompts)
+    # return random.sample(dataset.reqs, num_prompts)
+    input_all = 0
+    output_all = 0
+    for i in dataset.reqs:
+        input_all += i.prompt_len
+        output_all += i.output_len
+    print(input_all, output_all)
+    return dataset.reqs[:num_prompts]
 
 
 async def get_request(
@@ -225,7 +232,7 @@ def main(args: argparse.Namespace):
     input_requests = sample_requests(
         args.dataset, args.num_prompts
     )
-    print("Sampling done. Start benchmarking...")
+    print("Sampling done. Start benchmarking..., request_rate %s" % args.request_rate)
 
     global pbar
     pbar = tqdm(total=args.num_prompts)
@@ -246,13 +253,42 @@ def main(args: argparse.Namespace):
     benchmark_end_time = time.time()
     pbar.close()
     
+    all_ttft = []
+    all_tpot = []
+    for result in request_results:
+        ttft = result.ftl
+        all_ttft.append(ttft)
+        tpot = result.tpot
+        all_tpot.append(tpot)
+    mean_ttft_ms=np.mean(all_ttft or 0) *1000  # ttfts is empty if streaming is not supported by backend
+    median_ttft_ms=np.median(all_ttft or 0) * 1000
+    p99_ttft_ms=np.percentile(all_ttft or 0, 99) * 1000
+    mean_tpot_ms=np.mean(all_tpot or 0) * 1000
+    median_tpot_ms=np.median(all_tpot or 0) * 1000
+    p99_tpot_ms=np.percentile(all_tpot or 0, 99) * 1000
+    
     benchmark_time = benchmark_end_time - benchmark_start_time
     print(f"Total time: {benchmark_time:.2f} s")
     print(f"Throughput:")
     print(f"\t{args.num_prompts / benchmark_time:.2f} requests/s")
     print(f"\t{sum([req.prompt_len + req.output_len for req in input_requests]) / benchmark_time:.2f} tokens/s")
     print(f"\t{sum([req.output_len for req in input_requests]) / benchmark_time:.2f} output tokens/s")
-
+    print("{:<40} {:<10}".format("Total input tokens:", sum([req.prompt_len for req in input_requests])))
+    print("{:<40} {:<10}".format("Total generated tokens:",
+                                 sum([req.output_len for req in input_requests])))
+    print("{s:{c}^{n}}".format(s='Time to First Token', n=50, c='-'))
+    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", mean_ttft_ms))
+    print("{:<40} {:<10.2f}".format("Median TTFT (ms):",
+                                    median_ttft_ms))
+    print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", p99_ttft_ms))
+    print("{s:{c}^{n}}".format(s='Time per Output Token (excl. 1st token)',
+                               n=50,
+                               c='-'))
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):",
+                                    median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", p99_tpot_ms))
+    
     with open(args.output, "w") as f:
         json.dump(request_results, f, default=vars)
 
