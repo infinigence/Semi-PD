@@ -42,6 +42,8 @@ class ParaWorker:
         tensor_parallel_id: List[int] = None,   # Although the type is list[int], it is actually a NCCL unique ID
         pipeline_parallel_id: List[int] = None, # Same as above
     ) -> None:
+        import os
+        os.environ["NCCL_DEBUG"] = "INFO"
         self.worker_id = worker_id
         self.stage = stage
         self.model = None
@@ -73,6 +75,8 @@ class ParaWorker:
         # Statistics
         self.execution_time = 0.0
         self.blocked_swapping_time = 0.0
+        
+        self.decode_layers_num = self.model_config.hf_config.num_hidden_layers
 
     def ready(self):
         """
@@ -90,11 +94,13 @@ class ParaWorker:
         )
         self.model.init_communicator(self.tensor_parallel_id, self.pipeline_parallel_id)
         torch.cuda.synchronize()
-        if self.model_config.use_dummy_weights:
-            self.model.init_dummy_weights()
-        else:
-            path = download_and_convert_weights(self.model_config)
-            self.model.load_weight(path)
+        # if self.model_config.use_dummy_weights:
+        #     self.model.init_dummy_weights()
+        # else:
+        # path = download_and_convert_weights(self.model_config)
+        # print("model path : ", path)
+        # self.model.load_weight(path)
+        self.model.init_dummy_weights()
         torch.cuda.synchronize()
         logger.info(f"(worker {self.stage}.#{self.worker_id}) model {self.model_config.model} loaded")
 
@@ -214,13 +220,34 @@ class ParaWorker:
         start = time.time()
         # print(f"Worker {self.stage}.#{self.worker_id} Step begin")
         # run forward
-        generated_tokens_ids = self.model.forward(
+        # generated_tokens_ids = self.model.forward(
+        #     input_tokens_batched,
+        #     first_token_indexes,
+        #     self.k_cache,
+        #     self.v_cache,
+        #     block_table,
+        # )
+        # generated_tokens_ids = self.model.pipelined_forward(
+        #     input_tokens_batched,
+        #     first_token_indexes,
+        #     self.k_cache,
+        #     self.v_cache,
+        #     block_table,
+        # )
+        
+        self.model.prologue(
             input_tokens_batched,
             first_token_indexes,
             self.k_cache,
             self.v_cache,
             block_table,
         )
+        
+        for i in range(self.decode_layers_num):
+            self.model.execute_decoder_layer(i)
+            
+        generated_tokens_ids = self.model.epilogue()
+        
         self.execution_time += time.time() - start
         # print(f"Worker {self.stage}.#{self.worker_id} Step end")
 
