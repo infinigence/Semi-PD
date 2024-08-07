@@ -21,7 +21,15 @@ from distserve.downloader import download_and_convert_weights
 logger = init_logger(__name__)
 
 
-@ray.remote(num_cpus=0, num_gpus=1)
+@ray.remote(num_cpus=0, num_gpus=1, 
+            # runtime_env={ "nsight": "default"}
+            # runtime_env={
+            # "nsight": {
+            #     "t": "cuda,cudnn,cublas",
+            #     "o": "'worker_process_%p'",
+            #     "cuda-graph-trace": "node",
+            # }}
+            )
 class ParaWorker:
     """A worker class that executes (a partition of) the model on a GPU.
 
@@ -41,9 +49,10 @@ class ParaWorker:
         parallel_config: ParallelConfig = ParallelConfig(),
         tensor_parallel_id: List[int] = None,   # Although the type is list[int], it is actually a NCCL unique ID
         pipeline_parallel_id: List[int] = None, # Same as above
+        peer_ids = None,
     ) -> None:
         import os
-        os.environ["NCCL_DEBUG"] = "INFO"
+        # os.environ["NCCL_DEBUG"] = "INFO"
         self.worker_id = worker_id
         self.stage = stage
         self.model = None
@@ -76,7 +85,30 @@ class ParaWorker:
         self.execution_time = 0.0
         self.blocked_swapping_time = 0.0
         
+        
+         # FSDP relative
         self.decode_layers_num = self.model_config.hf_config.num_hidden_layers
+        self.peer_ids = peer_ids
+        self.peer_send_fn = None
+        
+
+
+    def set_peer_send_fn(self, fn):
+        self.peer_send_fn = fn
+    
+    def call_peer_send_fn(self, layer_id):
+        self.peer_send_fn(layer_id)
+
+    def send_weight(self, layer_id):
+        # fstr = "in context engine" if self.parallel_config.is_context else  "in decode engine"
+        # print("send invoked " + fstr)
+        self.model.send_weight(layer_id)
+        
+    def recv_weight(self, layer_id):
+        self.model.recv_weight(layer_id)
+        # self.model.wait_stream()
+        
+    
 
     def ready(self):
         """
@@ -93,6 +125,10 @@ class ParaWorker:
             self.model_config, self.parallel_config, self.cache_config
         )
         self.model.init_communicator(self.tensor_parallel_id, self.pipeline_parallel_id)
+        # self.model.init_p2p_communicator(self.peer_ids)
+        torch.cuda.synchronize()
+        print("is_context : ", self.parallel_config.is_context)
+        self.model.init_p2p_communicator(self.peer_ids[0])
         torch.cuda.synchronize()
         # if self.model_config.use_dummy_weights:
         #     self.model.init_dummy_weights()
@@ -242,9 +278,15 @@ class ParaWorker:
             self.v_cache,
             block_table,
         )
+        # print(f"worker is context : {self.parallel_config.is_context}")
         
         for i in range(self.decode_layers_num):
+            self.model.nccl_group_start()
+            if self.parallel_config.is_context != 1:
+                self.call_peer_send_fn(i)
+                self.recv_weight(i)
             self.model.execute_decoder_layer(i)
+            self.model.nccl_group_end()
             
         generated_tokens_ids = self.model.epilogue()
         

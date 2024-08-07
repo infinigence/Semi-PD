@@ -45,6 +45,7 @@ class ParallelConfig:
         tensor_parallel_rank: int = 0,
         pipeline_parallel_size: int = 1,
         pipeline_parallel_rank: int = 0,
+        is_context: int = 0,
     ) -> None:
         self.tensor_parallel_size = tensor_parallel_size
         self.tensor_parallel_rank = tensor_parallel_rank
@@ -53,13 +54,14 @@ class ParallelConfig:
 
         self.world_size = pipeline_parallel_size * tensor_parallel_size
         self.use_parallel = self.world_size > 1
-
+        self.is_context = is_context
     def to_list(self) -> List[int]:
         return [
             self.tensor_parallel_size,
             self.tensor_parallel_rank,
             self.pipeline_parallel_size,
             self.pipeline_parallel_rank,
+            self.is_context,
         ]
 
     def is_last_stage(self) -> bool:
@@ -81,6 +83,9 @@ class DisaggParallelConfig:
     ) -> None:
         self.context = context
         self.decoding = decoding
+        
+        self.context.is_context = 1
+        self.decoding.is_context = 0
     
     def get_num_workers(self) -> int:
         """Get the total number of workers (GPUs) needed."""

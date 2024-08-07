@@ -5,6 +5,7 @@ import asyncio
 import math
 import argparse
 
+import torch
 import ray
 from ray.util.placement_group import PlacementGroup
 
@@ -109,6 +110,12 @@ class LLMEngine:
         placement_groups = self._init_placement_groups()
         
         logger.info("Initializing context stage LLM engine")
+        
+        # only single device support currently
+        peer_id = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        peer_ids = [peer_id]
+        
+        
         self.context_engine = ContextStageLLMEngine(
             self.bridge_queue,
             model_config,
@@ -117,7 +124,8 @@ class LLMEngine:
             context_sched_config,
             placement_groups,
             self._on_new_step_output_callback,
-            self._on_new_lifetime_event_callback
+            self._on_new_lifetime_event_callback,
+            peer_ids=peer_ids
         )
         
         logger.info("Initializing decoding stage LLM engine")
@@ -130,8 +138,12 @@ class LLMEngine:
             placement_groups,
             self.context_engine.clear_migrated_blocks_callback,
             self._on_new_step_output_callback,
-            self._on_new_lifetime_event_callback
+            self._on_new_lifetime_event_callback,
+            peer_ids=peer_ids
         )
+        
+        # self.decoding_engine.workers[0][0].set_peer_send_fn.remote(self.context_engine.workers[0][0].send_weight)
+        
         
         # request_id -> list of StepOutput
         # Created when calling self.generate()
@@ -214,6 +226,9 @@ class LLMEngine:
             self.context_engine.kv_cache_mem_handles
         )
         self.engine_initialized = True
+        
+        self.decoding_engine.workers[0][0].set_peer_send_fn.remote(self.context_engine.workers[0][0].send_weight.remote)
+
         
     def _remote_call_all_workers(
         self, 

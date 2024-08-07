@@ -90,6 +90,7 @@ class SingleStageLLMEngine(ABC):
         placement_groups: List[PlacementGroup],
         engine_on_new_step_output_callback: Callable[[int, StepOutput], None],   # The LLMEngine's callback function when a new StepOutput of a particular request is generated
         engine_on_new_lifetime_event_callback: Optional[Callable[[int, LifetimeEvent, bool], None]] = None,   # The LLMEngine's callback function when a new LifetimeEvent of a particular request is generated
+        peer_ids = None
     ):
         self.stage = stage
         self.model_config = model_config
@@ -106,6 +107,8 @@ class SingleStageLLMEngine(ABC):
         )
 
         self.placement_groups = placement_groups
+        
+        self.peer_ids = peer_ids
         
         # workers[i][j] is the j-th tensor-parallel worker in pipeline stage i
         self.workers = []
@@ -152,7 +155,7 @@ class SingleStageLLMEngine(ABC):
         layer_per_placement_group = self.model_config.get_num_layers() // len(self.placement_groups)
         layer_per_pp = self.model_config.get_num_layers(self.parallel_config)
         pp_per_placement_group = layer_per_placement_group // layer_per_pp
-        
+        # create unique id
         pp_id = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
         
         init_handlers = []
@@ -167,7 +170,8 @@ class SingleStageLLMEngine(ABC):
                 tmp_parallel_config.tensor_parallel_rank = j
                 worker = ParaWorker.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=cur_placement_group
+                        placement_group=cur_placement_group,
+                        placement_group_capture_child_tasks=True,
                     )
                 ).remote(
                     worker_id=(i*self.parallel_config.tensor_parallel_size+j),
@@ -177,6 +181,7 @@ class SingleStageLLMEngine(ABC):
                     parallel_config=tmp_parallel_config,
                     pipeline_parallel_id=pp_id,
                     tensor_parallel_id=tp_id,
+                    peer_ids=self.peer_ids,
                 )
                 workers.append(worker)
                 init_handlers.append(worker.ready.remote())
@@ -270,7 +275,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         sched_config: ContextStageSchedConfig,
         placement_groups: List[PlacementGroup],
         engine_on_new_step_output_callback: Callable[[int, StepOutput], None],
-        engine_on_new_lifetime_event_callback: Callable[[int, LifetimeEvent, bool], None]
+        engine_on_new_lifetime_event_callback: Callable[[int, LifetimeEvent, bool], None],
+        peer_ids = None,
     ):
         super().__init__(
             Stage.CONTEXT,
@@ -280,7 +286,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
             sched_config,
             placement_groups,
             engine_on_new_step_output_callback,
-            engine_on_new_lifetime_event_callback
+            engine_on_new_lifetime_event_callback,
+            peer_ids = peer_ids
         )
         
         # All the batchedrequests that are pushed into the pipeline
@@ -469,7 +476,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         placement_groups: List[PlacementGroup],
         clear_migrated_blocks_callback: Callable[[Request], None],
         engine_on_new_step_output_callback: Callable[[int, StepOutput], None],
-        engine_on_new_lifetime_event_callback: Callable[[int, LifetimeEvent, bool], None]
+        engine_on_new_lifetime_event_callback: Callable[[int, LifetimeEvent, bool], None],
+        peer_ids = None,
     ):
         super().__init__(
             Stage.DECODING,
@@ -479,7 +487,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             sched_config,
             placement_groups,
             engine_on_new_step_output_callback,
-            engine_on_new_lifetime_event_callback
+            engine_on_new_lifetime_event_callback,
+            peer_ids=peer_ids
         )
         
         self.bridge_queue = bridge_queue
@@ -643,7 +652,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 tp = self.parallel_config.tensor_parallel_size
                 Decode_TflopS = decode_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
                 P_mfu =  Decode_TflopS / 312
-                logger.info("decode run : tokens %d, batch %s, latency %s ms,  p_mfu %f, decode_flops %f, pp %s , tp %s", total_tokens, batch_size, latency, P_mfu, decode_flops, pp, tp)
+                logger.info("decode run : tokens %d, batch %s, latency %s ms,  p_mfu %f, decode_flops %f, pp %s , tp %s is_context %s", total_tokens, batch_size, latency, P_mfu, decode_flops, pp, tp, self.parallel_config.is_context)
                 generated_tokens = []
                 for gen_token_id in generated_tokens_ids:
                     try:
