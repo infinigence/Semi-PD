@@ -124,6 +124,9 @@ class DecodingStageFCFSScheduler(DecodingStageScheduler):
         self.block_manager = block_manager
         self.engine_migrate_block_callback = engine_migrate_block_callback
 
+    def set_block_manager(self,block_manager):
+        self.block_manager = block_manager
+    
     def _get_block_needed(self, length: int):
         block_size = self.block_manager.cache_config.block_size
         return (length + block_size - 1) // block_size

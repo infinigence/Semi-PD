@@ -128,21 +128,31 @@ class SingleStageLLMEngine(ABC):
         logger.info(f"Initializing {self.stage.name} kvcaches")
         self.num_gpu_blocks, self.num_cpu_blocks = await self._init_kvcache()
 
-        self.block_manager = BlockManager(
-            self.stage,
-            self.num_gpu_blocks,
-            self.num_cpu_blocks,
-            self.model_config,
-            self.parallel_config,
-            self.cache_config,
-            self._remote_call_all_workers_async,
-        )
+        if self.parallel_config.is_context == 1:
+            self.block_manager = BlockManager(
+                self.stage,
+                self.num_gpu_blocks,
+                self.num_cpu_blocks,
+                self.model_config,
+                self.parallel_config,
+                self.cache_config,
+                self._remote_call_all_workers_async,
+            )
+        else:
+            self.block_manager = None
+            logger.info("Enable unified block manager, Decodesince the MPS merged the GPU memory")
         
         self.scheduler: ContextStageScheduler | DecodingStageScheduler = self._get_scheduler()
 
         logger.info(f"Scheduler: {self.scheduler}")
         logger.info(f"Block manager: {self.block_manager}")
 
+    def set_block_manager(self, block_manager):
+        self.scheduler.set_block_manager(block_manager)
+        self.block_manager = block_manager
+
+    def get_block_manager(self):
+        return self.block_manager
 
     async def _init_workers(self):
         """
@@ -226,6 +236,42 @@ class SingleStageLLMEngine(ABC):
             self.kv_cache_mem_handles.append(kv_cache_mem_handles)
         
         return num_gpu_blocks, num_cpu_blocks
+
+    async def _init_flatten_weight_handles(self):
+        flatten_weight_mem_handles_list = await asyncio.gather(*self._remote_call_all_workers_async(
+            "get_weight_ipc_handle"
+        ))
+        self.flatten_weight_mem_handles = []
+        for stage in self.workers:
+            flatten_weight_mem_handles = []
+            for worker in stage:
+                flatten_weight_mem_handles.append(flatten_weight_mem_handles_list.pop(0))
+            self.flatten_weight_mem_handles.append(flatten_weight_mem_handles)
+
+    async def register_weight_mem_handles(
+        self,
+        context_parallel_config: ParallelConfig,
+        weight_mem_handles: List[List[cudaMemoryIpcHandle]]
+    ):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+        self.weight_mem_handles = weight_mem_handles
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "register_weight_mem_handles",
+            context_parallel_config,
+            weight_mem_handles
+        ))
+        
+    async def lazy_init_weight(self):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "lazy_init_weight"
+        ))
 
     def _remote_call_all_workers_async(self, func_name: str, *args):
         """
@@ -325,6 +371,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         else:
             logger.info(f"(context) Forwarding with lengths {[len(request.prompt_token_ids) for request in batched_requests.requests]}")
             # allocate blocks as needed
+            logger.info("----------before-prefill-forward--------")
+            self.block_manager.print_block_usage()
             self.block_manager.allocate_blocks_batched(batched_requests)
             
             # Log down the lifetime event
@@ -337,7 +385,6 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
             batched_requests.start_one_iteration(time.time())
             tokens_per_batch = batched_requests.requests[0].prompt_token_ids.__len__()
             self.batches_in_pipeline.append(batched_requests)
-            
             remote_calls = self._remote_call_all_workers_async(
                 "step",
                 batched_requests.get_request_ids(),
@@ -363,7 +410,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
             else:
                 generated_tokens_ids = await self.batches_ret_futures[0]
                 
-                
+                logger.info("----------after-prefill-forward--------")
+                self.block_manager.print_block_usage()
                 
                     
                 end_time = time.time()
@@ -448,7 +496,7 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         
         async def event_loop2():
             while True:
-                self.print_engine_status()
+                # self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
 
         await asyncio.gather(event_loop1(), event_loop2())
@@ -514,6 +562,26 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             context_parallel_config,
             kv_cache_mem_handles
         ))
+        
+    async def get_shared_kv_tensor(self):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+        
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "get_shared_kv_tensor",
+        ))
+        
+    async def get_shared_weight_tensor(self, tensor_size):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+        
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "get_shared_weight_tensor",tensor_size
+        ))
     
     def _free_request_resources(self, request_id: int):
         super()._free_request_resources(request_id)
@@ -542,31 +610,44 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         generated_token_ids_bkup = migrating_req.req.generated_token_ids
         migrating_req.req.generated_tokens = []
         migrating_req.req.generated_token_ids = []
+        logger.info("----------before-migrate_blocks--------")
+        self.block_manager.print_block_usage()
         self.block_manager.allocate_blocks(migrating_req.req)
         migrating_req.req.generated_tokens = generated_token_bkup
         migrating_req.req.generated_token_ids = generated_token_ids_bkup
         
         target_block_indexes = self.block_manager.get_block_table(migrating_req.req.request_id)
         assert len(target_block_indexes) == len(migrating_req.block_indexes)
+        logger.info("target_block_indexes %s, \n migrate_block_indexes %s", target_block_indexes, migrating_req.block_indexes)
+        bypass = True
+        if not bypass:
+            # Transfer the blocks
+            self.engine_on_new_lifetime_event_callback(
+                migrating_req.req.request_id,
+                LifetimeEvent(LifetimeEventType.MigrationBegin)
+            )
+            # logger.info("----------before-migrate_blocks--------")
+            # self.block_manager.print_block_usage()
+            await asyncio.wait(self._remote_call_all_workers_async(
+                "migrate_blocks",
+                migrating_req.block_indexes,
+                migrating_req.context_parallel_config,
+                target_block_indexes
+            ))
+            logger.info("----------after-migrate_blocks--------")
+            self.block_manager.print_block_usage()
+            self.engine_on_new_lifetime_event_callback(
+                migrating_req.req.request_id,
+                LifetimeEvent(LifetimeEventType.MigrationEnd)
+            )
         
-        # Transfer the blocks
-        self.engine_on_new_lifetime_event_callback(
-            migrating_req.req.request_id,
-            LifetimeEvent(LifetimeEventType.MigrationBegin)
-        )
-        await asyncio.wait(self._remote_call_all_workers_async(
-            "migrate_blocks",
-            migrating_req.block_indexes,
-            migrating_req.context_parallel_config,
-            target_block_indexes
-        ))
-        self.engine_on_new_lifetime_event_callback(
-            migrating_req.req.request_id,
-            LifetimeEvent(LifetimeEventType.MigrationEnd)
-        )
-    
-        # Clear the blocks on the context engine's side
-        self.clear_migrated_blocks_callback(migrating_req)
+            # Clear the blocks on the context engine's side
+            self.clear_migrated_blocks_callback(migrating_req)
+        else:
+            self.engine_on_new_lifetime_event_callback(
+                migrating_req.req.request_id,
+                LifetimeEvent(LifetimeEventType.MigrationEnd)
+            )
             
     async def _step(self) -> None:
         """
@@ -608,6 +689,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             # push the batch into pipeline
             batched_requests.start_one_iteration(time.time())
             self.batches_in_pipeline.append(batched_requests)
+            logger.info("----------before-decode-forward--------")
+            self.block_manager.print_block_usage()
             remote_calls = self._remote_call_all_workers_async(
                 "step",
                 batched_requests.get_request_ids(),
@@ -631,6 +714,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 self.batches_ret_futures.pop(0)
             else:
                 generated_tokens_ids = await self.batches_ret_futures[0]
+                logger.info("----------after-decode-forward--------")
+                self.block_manager.print_block_usage()
                 end_time = time.time()
                 latency = (end_time - batched_requests.start_time) * 1e3
                 

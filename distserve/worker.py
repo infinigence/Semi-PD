@@ -19,15 +19,17 @@ from distserve.logger import init_logger
 from distserve.downloader import download_and_convert_weights
 
 logger = init_logger(__name__)
+# from ray._private.runtime_env.
 
-
-@ray.remote(num_cpus=0, num_gpus=1, 
+@ray.remote(num_cpus=0, num_gpus=0.5, 
             # runtime_env={ "nsight": "default"}
             # runtime_env={
             # "nsight": {
-            #     "t": "cuda,cudnn,cublas",
-            #     "o": "'worker_process_%p'",
             #     "cuda-graph-trace": "node",
+            #     "t": "cuda,cudnn,cublas,nvtx",
+            #     "o": "'worker_process_%p'",
+            #     "cudabacktrace": "all",
+            #     "stop-on-exit": "true",
             # }}
             )
 class ParaWorker:
@@ -100,9 +102,11 @@ class ParaWorker:
         self.peer_send_fn(layer_id)
 
     def send_weight(self, layer_id):
+        self.model.nccl_group_start()
         # fstr = "in context engine" if self.parallel_config.is_context else  "in decode engine"
         # print("send invoked " + fstr)
         self.model.send_weight(layer_id)
+        self.model.nccl_group_end()
         
     def recv_weight(self, layer_id):
         self.model.recv_weight(layer_id)
@@ -121,24 +125,39 @@ class ParaWorker:
     def init_model(self):
         # Initialize the model.
         set_random_seed(self.model_config.seed)
+        # breakpoint()
         self.model = get_model_op(
             self.model_config, self.parallel_config, self.cache_config
         )
+        # breakpoint()
         self.model.init_communicator(self.tensor_parallel_id, self.pipeline_parallel_id)
         # self.model.init_p2p_communicator(self.peer_ids)
         torch.cuda.synchronize()
         print("is_context : ", self.parallel_config.is_context)
-        self.model.init_p2p_communicator(self.peer_ids[0])
+        # self.model.init_p2p_communicator(self.peer_ids[0])
+        # breakpoint()
         torch.cuda.synchronize()
+        lazy_init = True
         # if self.model_config.use_dummy_weights:
-        #     self.model.init_dummy_weights()
+        if self.parallel_config.is_context == 1:
+            self.model.init_dummy_weights()
+        else:
+            if not lazy_init:
+                self.model.init_dummy_weights_fsdp()
         # else:
         # path = download_and_convert_weights(self.model_config)
         # print("model path : ", path)
         # self.model.load_weight(path)
-        self.model.init_dummy_weights()
+        # if self.parallel_config.is_context:
+            # self.model.init_dummy_weights()
+        # 
+        # print(weight_tensor[0:10])
+        # breakpoint()
         torch.cuda.synchronize()
         logger.info(f"(worker {self.stage}.#{self.worker_id}) model {self.model_config.model} loaded")
+
+    def lazy_init_weight(self):
+        self.model.lazy_init_weight()
 
     def init_kvcache_and_swap(self, num_gpu_blocks, num_cpu_blocks) -> (cudaMemoryIpcHandle, cudaMemoryIpcHandle):
         """
@@ -155,12 +174,21 @@ class ParaWorker:
             self.cache_config.block_size,
             self.model_config.get_head_size(),
         )
-        self.k_cache = torch.empty(
-            kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
-        )
-        self.v_cache = torch.empty(
-            kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
-        )
+        
+        # self.k_cache = torch.empty(
+        #     kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
+        # )
+        # self.v_cache = torch.empty(
+        #     kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
+        # )
+        if self.parallel_config.is_context == 1:
+            self.k_cache = torch.empty(
+                kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
+            )
+            self.v_cache = torch.empty(
+                kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
+            )
+        self.gpu_kv_cache_shape = kv_cache_shape
         # kv swap is [num_cpu_blocks, num_layers, num_local_heads, block_size, head_dim]
         # We pin memory here in order to leverage cudaMemcpyAsync when swapping
         kv_swap_shape = (num_cpu_blocks,) + kv_cache_shape[1:]
@@ -171,9 +199,61 @@ class ParaWorker:
             kv_swap_shape, dtype=self.model_config.get_torch_dtype(), device="cpu", pin_memory=True
         )
         torch.cuda.synchronize()
+                
+        # why ipc?
+        # breakpoint()
         
-        return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
-               torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
+        # return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
+        #         torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
+        
+        if self.parallel_config.is_context == 1:
+            return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
+                torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
+        return None,None
+
+    def get_weight_ipc_handle(self):
+        weight_tensors = self.model.get_flatten_weight()
+        # self.flatten_weight_size = weight_tensor.numel()
+        # breakpoint()
+        self.flatten_weight_size_vec = []
+        handles = []
+        for t in weight_tensors:
+            handle = torch.ops.block_migration_ops.get_ipc_mem_handle(t)
+            self.flatten_weight_size_vec.append(t.numel())
+            handles.append(handle)
+        # breakpoint()
+        return handles
+        # return torch.ops.block_migration_ops.get_ipc_mem_handle(weight_tensor)
+
+    def get_shared_weight_tensor(self,tensor_size):
+        shared_weight = torch.ops.block_migration_ops.share_weight_memory(self.parallel_config.to_list(), tensor_size)
+        # self.model.set_flatten_weight_from_tensor(shared_weight)
+        # breakpoint()
+        logger.info("get shared weight")
+
+    def register_weight_mem_handles(
+        self,
+        context_parallel_config: ParallelConfig,
+        weight_ipc_mem_handles: List[List[cudaMemoryIpcHandle]]
+    ):
+        self.context_parallel_config = copy.deepcopy(context_parallel_config)
+        tmp_parallel_config = copy.deepcopy(context_parallel_config)
+        pp_rank = self.parallel_config.pipeline_parallel_rank
+        tp_rank = self.parallel_config.tensor_parallel_rank
+        logger.info("(PP=%s, TP=%s), ipc weight registered")
+        torch.ops.block_migration_ops.register_weight_ipc_mem_handle(
+                weight_ipc_mem_handles[pp_rank][tp_rank],
+                tmp_parallel_config.to_list(),
+            )
+
+    def get_shared_kv_tensor(self):
+        import functools
+        import operator
+        tensor_size = functools.reduce(operator.mul, self.gpu_kv_cache_shape)
+        shared_k_tensor, shared_v_tensor = torch.ops.block_migration_ops.share_kv_cache_memory(self.context_parallel_config.to_list(), self.parallel_config.to_list(), tensor_size)
+        self.k_cache = shared_k_tensor.reshape(self.gpu_kv_cache_shape)
+        self.v_cache = shared_v_tensor.reshape(self.gpu_kv_cache_shape)
+        logger.info("get_shared_kv_tensor invoke")
 
     def _get_block_size_in_bytes(
         self,
@@ -218,8 +298,12 @@ class ParaWorker:
         logger.info(
             f"kv cache size for one token: {block_size_in_bytes / block_size / MB:.5f} MB"
         )
+        # num_gpu_blocks = int(
+        #     (total_gpu_memory * gpu_memory_utilization - peak_runtime_memory)
+        #     // block_size_in_bytes
+        # )
         num_gpu_blocks = int(
-            (total_gpu_memory * gpu_memory_utilization - peak_runtime_memory)
+            (total_gpu_memory - peak_runtime_memory) * gpu_memory_utilization
             // block_size_in_bytes
         )
         num_cpu_blocks = int(cpu_swap_space // block_size_in_bytes)
@@ -279,14 +363,18 @@ class ParaWorker:
             block_table,
         )
         # print(f"worker is context : {self.parallel_config.is_context}")
-        
+        torch.cuda.synchronize()
+        # if self.parallel_config.is_context == 1:
         for i in range(self.decode_layers_num):
-            self.model.nccl_group_start()
-            if self.parallel_config.is_context != 1:
-                self.call_peer_send_fn(i)
-                self.recv_weight(i)
+            # logger.info("layer %d forward", i)
+            # self.model.nccl_group_start()
+            # if self.parallel_config.is_context != 1:
+            #     self.call_peer_send_fn(i) # proc 0
+            #     self.model.nccl_group_start()
+            #     self.recv_weight(i) # proc1
+            #     self.model.nccl_group_end()
             self.model.execute_decoder_layer(i)
-            self.model.nccl_group_end()
+            # self.model.nccl_group_end()
             
         generated_tokens_ids = self.model.epilogue()
         
@@ -300,6 +388,7 @@ class ParaWorker:
         context_parallel_config: ParallelConfig,
         kvcache_ipc_mem_handles: List[List[Tuple[cudaMemoryIpcHandle, cudaMemoryIpcHandle]]]
     ):
+        self.context_parallel_config = copy.deepcopy(context_parallel_config)
         for pp_rank, stage_workers in enumerate(kvcache_ipc_mem_handles):
             for tp_rank, mem_handle in enumerate(stage_workers):
                 tmp_parallel_config = copy.deepcopy(context_parallel_config)

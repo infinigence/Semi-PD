@@ -221,10 +221,28 @@ class LLMEngine:
             self.context_engine.initialize(),
             self.decoding_engine.initialize()
         )
+        # await self.context_engine.initialize()
+        # await self.decoding_engine.initialize()
+        
+        self.decoding_engine.set_block_manager(self.context_engine.get_block_manager())
+        
         await self.decoding_engine.register_kvcache_mem_handles(
             self.context_engine.parallel_config,
             self.context_engine.kv_cache_mem_handles
         )
+        
+        await self.context_engine._init_flatten_weight_handles()
+        await self.decoding_engine.register_weight_mem_handles(
+            self.context_engine.parallel_config,
+            self.context_engine.flatten_weight_mem_handles,
+        )
+        await self.decoding_engine.lazy_init_weight()
+        
+        bypass = True
+        if bypass:
+            await self.decoding_engine.get_shared_kv_tensor()
+            # Debug use
+            # await self.decoding_engine.get_shared_weight_tensor(1024)
         self.engine_initialized = True
         
         self.decoding_engine.workers[0][0].set_peer_send_fn.remote(self.context_engine.workers[0][0].send_weight.remote)
