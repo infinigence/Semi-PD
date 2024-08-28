@@ -21,7 +21,11 @@ from distserve.downloader import download_and_convert_weights
 logger = init_logger(__name__)
 # from ray._private.runtime_env.
 
-@ray.remote(num_cpus=0, num_gpus=0.5, 
+import os
+ENABLE_MPS = os.getenv("ENABLE_MPS", False)
+@ray.remote(num_cpus=0,
+            num_gpus=(0.5 if ENABLE_MPS else 1),
+            # num_gpus=1,
             # runtime_env={ "nsight": "default"}
             # runtime_env={
             # "nsight": {
@@ -156,10 +160,10 @@ class ParaWorker:
         torch.cuda.synchronize()
         logger.info(f"(worker {self.stage}.#{self.worker_id}) model {self.model_config.model} loaded")
 
-    def lazy_init_weight(self):
-        self.model.lazy_init_weight()
+    def lazy_init_weight(self, enable_ipc_mem):
+        self.model.lazy_init_weight(enable_ipc_mem)
 
-    def init_kvcache_and_swap(self, num_gpu_blocks, num_cpu_blocks) -> (cudaMemoryIpcHandle, cudaMemoryIpcHandle):
+    def init_kvcache_and_swap(self, num_gpu_blocks, num_cpu_blocks, bypass_block_init=False) -> (cudaMemoryIpcHandle, cudaMemoryIpcHandle):
         """
         Allocate the K/V cache and swap.
         
@@ -181,13 +185,19 @@ class ParaWorker:
         # self.v_cache = torch.empty(
         #     kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
         # )
-        if self.parallel_config.is_context == 1:
+        # if self.parallel_config.is_context == 1:
+        if not bypass_block_init:
             self.k_cache = torch.empty(
                 kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
             )
             self.v_cache = torch.empty(
                 kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
             )
+            logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} alloc kv cache, shape={kv_cache_shape}\033[0m")
+
+        else:
+            logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} use shared kv cache tensor\033[0m")
+
         self.gpu_kv_cache_shape = kv_cache_shape
         # kv swap is [num_cpu_blocks, num_layers, num_local_heads, block_size, head_dim]
         # We pin memory here in order to leverage cudaMemcpyAsync when swapping
@@ -240,7 +250,7 @@ class ParaWorker:
         tmp_parallel_config = copy.deepcopy(context_parallel_config)
         pp_rank = self.parallel_config.pipeline_parallel_rank
         tp_rank = self.parallel_config.tensor_parallel_rank
-        logger.info("(PP=%s, TP=%s), ipc weight registered")
+        logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} (PP={pp_rank}, TP={tp_rank}), ipc weight registered")
         torch.ops.block_migration_ops.register_weight_ipc_mem_handle(
                 weight_ipc_mem_handles[pp_rank][tp_rank],
                 tmp_parallel_config.to_list(),
@@ -250,10 +260,12 @@ class ParaWorker:
         import functools
         import operator
         tensor_size = functools.reduce(operator.mul, self.gpu_kv_cache_shape)
-        shared_k_tensor, shared_v_tensor = torch.ops.block_migration_ops.share_kv_cache_memory(self.context_parallel_config.to_list(), self.parallel_config.to_list(), tensor_size)
+        # shared_k_tensor, shared_v_tensor = torch.ops.block_migration_ops.share_kv_cache_memory(self.context_parallel_config.to_list(), self.parallel_config.to_list(), tensor_size)
+        shared_k_tensor, shared_v_tensor = torch.ops.block_migration_ops.share_kv_cache_memory(self.parallel_config.to_list(), self.parallel_config.to_list(), tensor_size)
         self.k_cache = shared_k_tensor.reshape(self.gpu_kv_cache_shape)
         self.v_cache = shared_v_tensor.reshape(self.gpu_kv_cache_shape)
-        logger.info("get_shared_kv_tensor invoke")
+        logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} set kvcache tensor to context instance IPC tensor\033[0m")
+
 
     def _get_block_size_in_bytes(
         self,

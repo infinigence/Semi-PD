@@ -28,12 +28,15 @@ from distserve.utils import Counter
 from distserve.single_stage_engine import (
     StepOutput,
     ContextStageLLMEngine,
-    DecodingStageLLMEngine
+    DecodingStageLLMEngine,
+    SingleStageLLMEngine
 )
 from distserve.lifetime import LifetimeEvent, LifetimeEventType
 
 logger = init_logger(__name__)
-
+import os
+ENABLE_MPS = bool(os.getenv("ENABLE_MPS", False))
+logger.info("\033[1;32;40mENABLE MPS = %s\033[0m", ENABLE_MPS)
 
 class LLMEngine:
     """
@@ -188,10 +191,13 @@ class LLMEngine:
         context_tp = self.disagg_parallel_config.context.tensor_parallel_size
         decoding_pp = self.disagg_parallel_config.decoding.pipeline_parallel_size
         decoding_tp = self.disagg_parallel_config.decoding.tensor_parallel_size
+        # mps only support same pp and tp
+        assert context_pp == decoding_pp and context_tp == decoding_tp
         
         # Each placement group is responsible for `layer_per_placement_group` layers
         layer_per_context_pp = self.model_config.get_num_layers(self.disagg_parallel_config.context)
         layer_per_decoding_pp = self.model_config.get_num_layers(self.disagg_parallel_config.decoding)
+        
         layer_per_placement_group = math.lcm(layer_per_context_pp, layer_per_decoding_pp)
         
         # Each placement group contains `workers_per_placement_group` workers
@@ -205,10 +211,12 @@ class LLMEngine:
             context_pp * context_tp + decoding_pp * decoding_tp
         
         # Create placement groups
+        resource_unit = { "GPU": 0.5 } if ENABLE_MPS else { "GPU": 1 }
         placement_groups = []
         for i in range(num_placement_groups):
             placement_group = ray.util.placement_group(
-                [ { "GPU": 1 }] * workers_per_placement_group,
+                [resource_unit] * workers_per_placement_group,
+                # [ { "GPU": 1 }] * workers_per_placement_group,
                 strategy="STRICT_PACK",
             )
             ray.get(placement_group.ready(), timeout=1000)
@@ -217,12 +225,19 @@ class LLMEngine:
         return placement_groups
         
     async def initialize(self):
-        await asyncio.gather(
-            self.context_engine.initialize(),
-            self.decoding_engine.initialize()
-        )
-        # await self.context_engine.initialize()
-        # await self.decoding_engine.initialize()
+        bypass_worker_init = False
+        bypass_block_init = False
+        enable_ipc_mem = False
+        if ENABLE_MPS:
+            bypass_worker_init = True
+            bypass_block_init = True
+            enable_ipc_mem = True
+        
+        
+        if bypass_worker_init:
+            SingleStageLLMEngine.collective_init_workers(self.context_engine, self.decoding_engine)
+        await self.context_engine.initialize(bypass_worker_init=bypass_worker_init)
+        await self.decoding_engine.initialize(bypass_block_init=bypass_block_init, bypass_worker_init=bypass_worker_init)
         
         self.decoding_engine.set_block_manager(self.context_engine.get_block_manager())
         
@@ -230,16 +245,17 @@ class LLMEngine:
             self.context_engine.parallel_config,
             self.context_engine.kv_cache_mem_handles
         )
+
+        if enable_ipc_mem:
+            await self.context_engine._init_flatten_weight_handles()
+            await self.decoding_engine.register_weight_mem_handles(
+                self.context_engine.parallel_config,
+                self.context_engine.flatten_weight_mem_handles,
+            )
+        await self.decoding_engine.lazy_init_weight(enable_ipc_mem)
         
-        await self.context_engine._init_flatten_weight_handles()
-        await self.decoding_engine.register_weight_mem_handles(
-            self.context_engine.parallel_config,
-            self.context_engine.flatten_weight_mem_handles,
-        )
-        await self.decoding_engine.lazy_init_weight()
-        
-        bypass = True
-        if bypass:
+        # bypass_block_init = True
+        if bypass_block_init:
             await self.decoding_engine.get_shared_kv_tensor()
             # Debug use
             # await self.decoding_engine.get_shared_weight_tensor(1024)

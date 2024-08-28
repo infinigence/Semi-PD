@@ -113,22 +113,25 @@ class SingleStageLLMEngine(ABC):
         # workers[i][j] is the j-th tensor-parallel worker in pipeline stage i
         self.workers = []
     
-    async def initialize(self):
+    async def initialize(self, bypass_block_init=False, bypass_worker_init=False):
         """Initialize workers, load models and initialize k/v cache
         
         We seperate this function from __init__ because we want to run it in an async way
         to enable parallel initialization between Engines.
         """
-        logger.info(f"Initializing {self.stage.name} workers")
-        await self._init_workers()
+        if not bypass_worker_init:
+            logger.info(f"Initializing {self.stage.name} workers")
+            await self._init_workers()
         
         logger.info(f"Initializing {self.stage.name} models")
         await self._init_model()
         
         logger.info(f"Initializing {self.stage.name} kvcaches")
-        self.num_gpu_blocks, self.num_cpu_blocks = await self._init_kvcache()
+        self.num_gpu_blocks, self.num_cpu_blocks = await self._init_kvcache(bypass_block_init)
+        # self.num_gpu_blocks, self.num_cpu_blocks = await self._init_kvcache(False)
 
-        if self.parallel_config.is_context == 1:
+        # if self.parallel_config.is_context == 1:
+        if not bypass_block_init:
             self.block_manager = BlockManager(
                 self.stage,
                 self.num_gpu_blocks,
@@ -153,6 +156,72 @@ class SingleStageLLMEngine(ABC):
 
     def get_block_manager(self):
         return self.block_manager
+    
+    @classmethod
+    def collective_init_workers(cls, prefill_instance, decode_instance):
+        logger.info("Collective initialize workers")
+
+        layer_per_placement_group = prefill_instance.model_config.get_num_layers() // len(prefill_instance.placement_groups)
+        layer_per_pp = prefill_instance.model_config.get_num_layers(prefill_instance.parallel_config)
+        pp_per_placement_group = layer_per_placement_group // layer_per_pp
+        # create unique id
+        pp_id_prefill = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        pp_id_decode = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        init_handlers = []
+        for i in range(prefill_instance.parallel_config.pipeline_parallel_size):
+            prefill_workers = []
+            decode_workers = []
+            placement_group_index = i // pp_per_placement_group
+            tp_id_prefill = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+            tp_id_decode = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+            cur_placement_group = prefill_instance.placement_groups[placement_group_index]
+            for j in range(prefill_instance.parallel_config.tensor_parallel_size):
+                tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
+                tmp_parallel_config.pipeline_parallel_rank = i
+                tmp_parallel_config.tensor_parallel_rank = j
+                prefill_worker = ParaWorker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=cur_placement_group,
+                        placement_group_capture_child_tasks=True,
+                    )
+                ).remote(
+                    worker_id=(i*prefill_instance.parallel_config.tensor_parallel_size+j),
+                    stage=prefill_instance.stage,
+                    model_config=prefill_instance.model_config,
+                    cache_config=prefill_instance.cache_config,
+                    parallel_config=tmp_parallel_config,
+                    pipeline_parallel_id=pp_id_prefill,
+                    tensor_parallel_id=tp_id_prefill,
+                    peer_ids=prefill_instance.peer_ids,
+                )
+                prefill_workers.append(prefill_worker)
+                init_handlers.append(prefill_worker.ready.remote())
+                
+                tmp_parallel_config = copy.deepcopy(decode_instance.parallel_config)
+                tmp_parallel_config.pipeline_parallel_rank = i
+                tmp_parallel_config.tensor_parallel_rank = j
+                decode_worker = ParaWorker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=cur_placement_group,
+                        placement_group_capture_child_tasks=True,
+                    )
+                ).remote(
+                    worker_id=(i*decode_instance.parallel_config.tensor_parallel_size+j),
+                    stage=decode_instance.stage,
+                    model_config=decode_instance.model_config,
+                    cache_config=decode_instance.cache_config,
+                    parallel_config=tmp_parallel_config,
+                    pipeline_parallel_id=pp_id_decode,
+                    tensor_parallel_id=tp_id_decode,
+                    peer_ids=decode_instance.peer_ids,
+                )
+                
+                decode_workers.append(decode_worker)
+                init_handlers.append(decode_worker.ready.remote())
+            prefill_instance.workers.append(prefill_workers)
+            decode_instance.workers.append(decode_workers)
+            
+        # asyncio.wait(init_handlers)
 
     async def _init_workers(self):
         """
@@ -206,7 +275,7 @@ class SingleStageLLMEngine(ABC):
         handlers = self._remote_call_all_workers_async("init_model")
         await asyncio.wait(handlers)
 
-    async def _init_kvcache(self):
+    async def _init_kvcache(self, bypass_block_init=False):
         """
         Profile available blocks and initialize k/v cache on all workers
         """
@@ -224,7 +293,7 @@ class SingleStageLLMEngine(ABC):
             num_cpu_blocks = 1
         logger.info("Allocating kv cache")
         kv_cache_mem_handles_1d = await asyncio.gather(*self._remote_call_all_workers_async(
-            "init_kvcache_and_swap", num_gpu_blocks, num_cpu_blocks
+            "init_kvcache_and_swap", num_gpu_blocks, num_cpu_blocks, bypass_block_init
         ))
         
         # Gather the address of kv cache for block migration
@@ -264,13 +333,13 @@ class SingleStageLLMEngine(ABC):
             weight_mem_handles
         ))
         
-    async def lazy_init_weight(self):
+    async def lazy_init_weight(self, enable_ipc_mem):
         """
         Distribute kv cache memory IPC handles to workers and workers will
         register those handles.
         """
         await asyncio.wait(self._remote_call_all_workers_async(
-            "lazy_init_weight"
+            "lazy_init_weight", enable_ipc_mem
         ))
 
     def _remote_call_all_workers_async(self, func_name: str, *args):
@@ -293,7 +362,7 @@ class SingleStageLLMEngine(ABC):
         logger.warn(f"Request abortion is not implemented yet")
         return
         self.scheduler.abort_request(request_id)
-        self._free_request_resources(request_id)
+        self._free_request_resources(request_id, bypass=False)
     
     @abstractmethod
     async def start_event_loop(self):
@@ -346,8 +415,9 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
     def add_request(self, request: Request):
         self.scheduler.add_request(request)
     
-    def _free_request_resources(self, request_id: int):
-        super()._free_request_resources(request_id)
+    def _free_request_resources(self, request_id: int, bypass):
+        if not bypass:
+            super()._free_request_resources(request_id)
         
     async def _step(self):
         """
@@ -479,13 +549,13 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                         )
                         self.bridge_queue.put_nowait(migrating_req) # This won't panic because the queue is unbounded
                     else:
-                        self._free_request_resources(request.request_id)
+                        self._free_request_resources(request.request_id, bypass=False)
     
-    def clear_migrated_blocks_callback(self, migrated_request: MigratingRequest):
+    def clear_migrated_blocks_callback(self, migrated_request: MigratingRequest, bypass):
         """
         Called when the decoding engine finishes migrating the blocks of the request.
         """
-        self._free_request_resources(migrated_request.req.request_id)
+        self._free_request_resources(migrated_request.req.request_id, bypass)
         self.scheduler.on_request_migrated(migrated_request)
         
     async def start_event_loop(self):
@@ -568,7 +638,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         Distribute kv cache memory IPC handles to workers and workers will
         register those handles.
         """
-        
+
         await asyncio.wait(self._remote_call_all_workers_async(
             "get_shared_kv_tensor",
         ))
@@ -583,8 +653,10 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             "get_shared_weight_tensor",tensor_size
         ))
     
-    def _free_request_resources(self, request_id: int):
-        super()._free_request_resources(request_id)
+    def _free_request_resources(self, request_id: int, bypass):
+        # bypass = True
+        # if not bypass:
+        #     super()._free_request_resources(request_id)
         self.request_events.pop(request_id)
         self.request_outputs.pop(request_id)
         
@@ -620,14 +692,15 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         assert len(target_block_indexes) == len(migrating_req.block_indexes)
         logger.info("target_block_indexes %s, \n migrate_block_indexes %s", target_block_indexes, migrating_req.block_indexes)
         bypass = True
+        # bypass = False
         if not bypass:
             # Transfer the blocks
             self.engine_on_new_lifetime_event_callback(
                 migrating_req.req.request_id,
                 LifetimeEvent(LifetimeEventType.MigrationBegin)
             )
-            # logger.info("----------before-migrate_blocks--------")
-            # self.block_manager.print_block_usage()
+            logger.info("----------before-migrate_blocks--------")
+            self.block_manager.print_block_usage()
             await asyncio.wait(self._remote_call_all_workers_async(
                 "migrate_blocks",
                 migrating_req.block_indexes,
@@ -642,12 +715,13 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             )
         
             # Clear the blocks on the context engine's side
-            self.clear_migrated_blocks_callback(migrating_req)
+            self.clear_migrated_blocks_callback(migrating_req, bypass)
         else:
             self.engine_on_new_lifetime_event_callback(
                 migrating_req.req.request_id,
                 LifetimeEvent(LifetimeEventType.MigrationEnd)
             )
+            self.clear_migrated_blocks_callback(migrating_req, bypass)
             
     async def _step(self) -> None:
         """
