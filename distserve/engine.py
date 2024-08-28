@@ -239,7 +239,8 @@ class LLMEngine:
         await self.context_engine.initialize(bypass_worker_init=bypass_worker_init)
         await self.decoding_engine.initialize(bypass_block_init=bypass_block_init, bypass_worker_init=bypass_worker_init)
         
-        self.decoding_engine.set_block_manager(self.context_engine.get_block_manager())
+        if bypass_worker_init:
+            self.decoding_engine.set_block_manager(self.context_engine.get_block_manager())
         
         await self.decoding_engine.register_kvcache_mem_handles(
             self.context_engine.parallel_config,

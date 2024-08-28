@@ -489,7 +489,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 d = self.model_config.hf_config.hidden_size
                 l = self.model_config.hf_config.num_hidden_layers
                 batch_size = len(batched_requests.requests)
-                ffn_h = self.model_config.hf_config.ffn_dim
+                # ffn_h = self.model_config.hf_config.ffn_dim
+                ffn_h = 4
                 h_scale = ffn_h / d
                 
                 bld = 1 * l * d
@@ -797,7 +798,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 d = self.model_config.hf_config.hidden_size
                 l = self.model_config.hf_config.num_hidden_layers
                 batch_size = len(batched_requests.requests)
-                ffn_h = self.model_config.hf_config.ffn_dim
+                # ffn_h = self.model_config.hf_config.ffn_dim
+                ffn_h = 4
                 h_scale = ffn_h / d
                 
                 bld = 1 * l * d
