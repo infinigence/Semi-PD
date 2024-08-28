@@ -119,6 +119,9 @@ class SingleStageLLMEngine(ABC):
         We seperate this function from __init__ because we want to run it in an async way
         to enable parallel initialization between Engines.
         """
+        self.bypass_block_init = bypass_block_init
+        self.bypass_worker_init = bypass_worker_init
+        
         if not bypass_worker_init:
             logger.info(f"Initializing {self.stage.name} workers")
             await self._init_workers()
@@ -692,9 +695,9 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         target_block_indexes = self.block_manager.get_block_table(migrating_req.req.request_id)
         assert len(target_block_indexes) == len(migrating_req.block_indexes)
         logger.info("target_block_indexes %s, \n migrate_block_indexes %s", target_block_indexes, migrating_req.block_indexes)
-        bypass = True
+        # bypass = True
         # bypass = False
-        if not bypass:
+        if not self.bypass_block_init:
             # Transfer the blocks
             self.engine_on_new_lifetime_event_callback(
                 migrating_req.req.request_id,
@@ -716,13 +719,13 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             )
         
             # Clear the blocks on the context engine's side
-            self.clear_migrated_blocks_callback(migrating_req, bypass)
+            self.clear_migrated_blocks_callback(migrating_req, bypass=False)
         else:
             self.engine_on_new_lifetime_event_callback(
                 migrating_req.req.request_id,
                 LifetimeEvent(LifetimeEventType.MigrationEnd)
             )
-            self.clear_migrated_blocks_callback(migrating_req, bypass)
+            self.clear_migrated_blocks_callback(migrating_req, bypass=True)
             
     async def _step(self) -> None:
         """

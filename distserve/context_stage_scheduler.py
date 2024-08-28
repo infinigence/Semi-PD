@@ -143,17 +143,21 @@ class ContextStageFCFSScheduler(ContextStageScheduler):
                 + request.get_num_input_tokens()
                 <= self.sched_config.max_tokens_per_batch
             ) and (
-                # Limit 3. GPU blocks
+                # # Limit 3. GPU blocks
+                # sum([
+                #     self._get_block_needed(len(req.prompt_token_ids))
+                #     for req in next_batch.requests + [request]
+                # ]) +
+                # sum([
+                #     self._get_block_needed(len(req.prompt_token_ids))
+                #     for req in self.unaccepted_queue
+                # ]) +
+                # self.num_on_fly_request_block 
+                # <= self.block_manager.max_num_gpu_blocks * 0.9
                 sum([
                     self._get_block_needed(len(req.prompt_token_ids))
                     for req in next_batch.requests + [request]
-                ]) +
-                sum([
-                    self._get_block_needed(len(req.prompt_token_ids))
-                    for req in self.unaccepted_queue
-                ]) +
-                self.num_on_fly_request_block 
-                <= self.block_manager.max_num_gpu_blocks
+                ])<= self.block_manager.get_num_avail_gpu_blocks()
             )
     
         while len(self.waiting_queue) > 0:
@@ -163,6 +167,13 @@ class ContextStageFCFSScheduler(ContextStageScheduler):
                 self.waiting_queue.pop(0)
             else:
                 break
+        
+        # num_blocks = sum([
+        #     self._get_block_needed(req.get_input_len())
+        #     for req in next_batch.requests
+        # ])
+        
+        # assert num_blocks <= self.block_manager.get_num_avail_gpu_blocks()
         
         self.num_on_fly_request_block += sum([
             self._get_block_needed(req.get_input_len())
