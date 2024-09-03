@@ -23,10 +23,15 @@ logger = init_logger(__name__)
 
 import os
 ENABLE_MPS = os.getenv("ENABLE_MPS", False)
+CONTEXT_ENGINE_SM_PERCENTILE = int(os.getenv("CONTEXT_ENGINE_SM_PERCENTILE", 100))
+DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("DECODE_ENGINE_SM_PERCENTILE", 100))
+
 @ray.remote(num_cpus=0,
-            num_gpus=(0.5 if ENABLE_MPS else 1),
+            # num_gpus=(0.5 if ENABLE_MPS else 1),
+            # num_gpus=(0.25 if ENABLE_MPS else 1),
+            num_gpus=(0.20 if ENABLE_MPS else 1),
             # num_gpus=1,
-            # runtime_env={ "nsight": "default"}
+            # runtime_env={ "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50"}
             # runtime_env={
             # "nsight": {
             #     "cuda-graph-trace": "node",
@@ -48,6 +53,24 @@ class ParaWorker:
 
     def __init__(
         self,
+        # worker_id: int,
+        # stage: Stage,
+        # model_config: ModelConfig,
+        # cache_config: CacheConfig,
+        # parallel_config: ParallelConfig = ParallelConfig(),
+        # tensor_parallel_id: List[int] = None,   # Although the type is list[int], it is actually a NCCL unique ID
+        # pipeline_parallel_id: List[int] = None, # Same as above
+        # peer_ids = None,
+    ) -> None:
+        # import os
+        # if ENABLE_MPS:
+        #     if parallel_config.is_context == 1:
+        #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(CONTEXT_ENGINE_SM_PERCENTILE))
+        #     else:
+        #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(DECODE_ENGINE_SM_PERCENTILE))
+        pass
+    
+    def init(self,
         worker_id: int,
         stage: Stage,
         model_config: ModelConfig,
@@ -56,9 +79,20 @@ class ParaWorker:
         tensor_parallel_id: List[int] = None,   # Although the type is list[int], it is actually a NCCL unique ID
         pipeline_parallel_id: List[int] = None, # Same as above
         peer_ids = None,
+        thread_percentile = 100,
     ) -> None:
+        
         import os
-        # os.environ["NCCL_DEBUG"] = "INFO"
+        # if ENABLE_MPS:
+        #     if parallel_config.is_context == 1:
+        #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(CONTEXT_ENGINE_SM_PERCENTILE))
+        #     else:
+        #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(DECODE_ENGINE_SM_PERCENTILE))
+        # os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(50))
+        os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(thread_percentile))
+
+
+        # os.environ["NCCL_DEBUG"] = "INFO"      
         self.worker_id = worker_id
         self.stage = stage
         self.model = None
@@ -97,7 +131,25 @@ class ParaWorker:
         self.peer_ids = peer_ids
         self.peer_send_fn = None
         
+        # MPS
+        # if ENABLE_MPS:
+        #     if parallel_config.is_context == 1:
+        #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(CONTEXT_ENGINE_SM_PERCENTILE))
+        #     else:
+        #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(DECODE_ENGINE_SM_PERCENTILE))
+            # os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(50))
 
+            # SMs = torch.ops.block_migration_ops.get_device_available_SMs()
+            # logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} availabe SM count={SMs}\033[0m")        
+
+    def get_device_id(self):
+        return ray.get_gpu_ids()[0]
+
+    def exit(self):
+        ray.actor.exit_actor()
+
+    def get_state(self):
+        return 1
 
     def set_peer_send_fn(self, fn):
         self.peer_send_fn = fn
@@ -126,13 +178,18 @@ class ParaWorker:
         logger.info(f"Worker {self.stage}.#{self.worker_id} created on host {socket.gethostname()} and gpu #{self.gpu_id}")
         pass
 
-    def init_model(self):
+    def init_model(self, bypass_weigit_init):
         # Initialize the model.
+        SMs = torch.ops.block_migration_ops.get_device_available_SMs()
+        logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} availabe SM count={SMs}\033[0m")
+
         set_random_seed(self.model_config.seed)
         # breakpoint()
         self.model = get_model_op(
             self.model_config, self.parallel_config, self.cache_config
         )
+        if not bypass_weigit_init:
+            self.lazy_init_weight(enable_ipc_mem=True, is_alloc=True)
         # breakpoint()
         self.model.init_communicator(self.tensor_parallel_id, self.pipeline_parallel_id)
         # self.model.init_p2p_communicator(self.peer_ids)
@@ -143,11 +200,14 @@ class ParaWorker:
         torch.cuda.synchronize()
         lazy_init = True
         # if self.model_config.use_dummy_weights:
-        if self.parallel_config.is_context == 1:
+        # if self.parallel_config.is_context == 1:
+        if not bypass_weigit_init:
+            logger.info("init weight")
+            # breakpoint()
             self.model.init_dummy_weights()
-        else:
-            if not lazy_init:
-                self.model.init_dummy_weights_fsdp()
+        # else:
+        #     if not lazy_init:
+        #         self.model.init_dummy_weights_fsdp()
         # else:
         # path = download_and_convert_weights(self.model_config)
         # print("model path : ", path)
@@ -160,8 +220,8 @@ class ParaWorker:
         torch.cuda.synchronize()
         logger.info(f"(worker {self.stage}.#{self.worker_id}) model {self.model_config.model} loaded")
 
-    def lazy_init_weight(self, enable_ipc_mem):
-        self.model.lazy_init_weight(enable_ipc_mem)
+    def lazy_init_weight(self, enable_ipc_mem, is_alloc):
+        self.model.lazy_init_weight(enable_ipc_mem, is_alloc)
 
     def init_kvcache_and_swap(self, num_gpu_blocks, num_cpu_blocks, bypass_block_init=False) -> (cudaMemoryIpcHandle, cudaMemoryIpcHandle):
         """
@@ -216,7 +276,8 @@ class ParaWorker:
         # return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
         #         torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
         
-        if self.parallel_config.is_context == 1:
+        # if self.parallel_config.is_context == 1:
+        if not bypass_block_init:
             return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
                 torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
         return None,None
@@ -251,6 +312,7 @@ class ParaWorker:
         pp_rank = self.parallel_config.pipeline_parallel_rank
         tp_rank = self.parallel_config.tensor_parallel_rank
         logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} (PP={pp_rank}, TP={tp_rank}), ipc weight registered")
+        # breakpoint()
         torch.ops.block_migration_ops.register_weight_ipc_mem_handle(
                 weight_ipc_mem_handles[pp_rank][tp_rank],
                 tmp_parallel_config.to_list(),

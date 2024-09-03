@@ -2,6 +2,9 @@ import time, copy
 from typing import Callable, Optional, List, Dict, Tuple
 from abc import ABC, abstractmethod
 import asyncio
+from enum import Enum
+import contextvars
+from contextlib import contextmanager
 
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -44,6 +47,19 @@ SLEEP_IN_EACH_EVENT_LOOP = 0
 # Print engine status every this many seconds
 PRINT_STATUS_INTERVAL = 1
 
+SLEEP_FOR_MPS_RESCHEDULE = 0.5
+
+# 创建一个上下文变量
+WorkersManager = contextvars.ContextVar('workers_manager', default=0)
+
+@contextmanager
+def WorkersContext(new_value):
+    token = WorkersManager.set(new_value)
+    try:
+        yield WorkersManager
+    finally:
+        WorkersManager.reset(token)
+
 class StepOutput:
     """The output of request in one step of inference.
     It contains the information of corresponding request and the generated tokens until this step.
@@ -64,7 +80,18 @@ class StepOutput:
             f"new_token_id={self.new_token_id}, "
             f"is_finished={self.is_finished})"
         )
+class SwitchSemaphore(Enum):
+    """
+    The type of an event in a request's lifetime
+    """
+    REJECT = "REJECT"
+    START_INIT = "START_INIT",
+    # INITIALIZING = "INITIALIZING",
+    END_INIT = "END_INIT",
+    ACCEPT = "ACCEPT",
 
+    def __str__(self) -> str:
+        return self.value
     
 class SingleStageLLMEngine(ABC):
     """
@@ -113,7 +140,34 @@ class SingleStageLLMEngine(ABC):
         # workers[i][j] is the j-th tensor-parallel worker in pipeline stage i
         self.workers = []
     
-    async def initialize(self, bypass_block_init=False, bypass_worker_init=False):
+        self.workers_back_up = []
+        self.workers_back_up_1 = []
+        
+        self.worker_index = 0
+    
+        self.persistant_worker = None
+        
+        self.switch_semaphore = SwitchSemaphore.REJECT
+        self.switch_percentile = 100
+        self.semaphore_queue = []
+        self.step_count = 1
+       
+    def insert_semaphore(self, percentile):
+        self.semaphore_queue.append(percentile)
+         
+    async def set_persistent_worker(self):
+        self.persistant_worker = self.workers
+        self.workers = self.workers_back_up
+        self.workers_back_up = self.workers_back_up_1
+        
+    async def worker_switch(self):
+        logger.info("\033[1;32;40mWorker switched, semaphore=%s\033[0m",self.switch_semaphore.__str__())
+        self.worker_index ^= 1
+        tmp_worker = self.workers
+        self.workers = self.workers_back_up
+        self.workers_back_up = tmp_worker
+    
+    async def initialize(self, bypass_block_init=False, bypass_worker_init=False, bypass_weigit_init=False):
         """Initialize workers, load models and initialize k/v cache
         
         We seperate this function from __init__ because we want to run it in an async way
@@ -127,13 +181,11 @@ class SingleStageLLMEngine(ABC):
             await self._init_workers()
         
         logger.info(f"Initializing {self.stage.name} models")
-        await self._init_model()
+        await self._init_model(bypass_weigit_init=bypass_weigit_init)
         
         logger.info(f"Initializing {self.stage.name} kvcaches")
         self.num_gpu_blocks, self.num_cpu_blocks = await self._init_kvcache(bypass_block_init)
-        # self.num_gpu_blocks, self.num_cpu_blocks = await self._init_kvcache(False)
 
-        # if self.parallel_config.is_context == 1:
         if not bypass_block_init:
             self.block_manager = BlockManager(
                 self.stage,
@@ -160,8 +212,74 @@ class SingleStageLLMEngine(ABC):
     def get_block_manager(self):
         return self.block_manager
     
+    
+    async def restart_back_up_workers(self, new_percentage):
+        """
+        for each pipeline stage, create tensor_parallel_size workers
+        each worker will be assigned a GPU
+        the worker will be placed in the corresponding placement group
+        """
+        logger.info("Initializing workers")
+
+        layer_per_placement_group = self.model_config.get_num_layers() // len(self.placement_groups)
+        layer_per_pp = self.model_config.get_num_layers(self.parallel_config)
+        pp_per_placement_group = layer_per_placement_group // layer_per_pp
+        # create unique id
+        pp_id = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        
+        init_handlers = []
+        # workaround, since ray don't have ability to specific set gpu id, so we need to fulfill server
+        # first, then kill the worker we need and restart
+        for tp_workers in self.workers_back_up:
+            for worker in tp_workers:
+                worker.exit.remote()
+
+                while True:
+                    try:
+                        ray.get(worker.get_state.remote())
+                    except ray.exceptions.RayActorError:
+                        print("Actor has been killed.")
+                        break
+                    except Exception as e:
+                        print(f"Exception occurred: {e}")
+                        break
+                    time.sleep(0.1)
+
+        self.workers_back_up = []
+        for i in range(self.parallel_config.pipeline_parallel_size):
+            workers = []
+            placement_group_index = i // pp_per_placement_group
+            tp_id = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+            cur_placement_group = self.placement_groups[placement_group_index]
+            for j in range(self.parallel_config.tensor_parallel_size):
+                tmp_parallel_config = copy.deepcopy(self.parallel_config)
+                tmp_parallel_config.pipeline_parallel_rank = i
+                tmp_parallel_config.tensor_parallel_rank = j
+                worker = ParaWorker.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=cur_placement_group,
+                        placement_group_capture_child_tasks=True,
+                    )
+                ).remote()
+                worker.init.remote(
+                    worker_id=(i*self.parallel_config.tensor_parallel_size+j),
+                    stage=self.stage,
+                    model_config=self.model_config,
+                    cache_config=self.cache_config,
+                    parallel_config=tmp_parallel_config,
+                    pipeline_parallel_id=pp_id,
+                    tensor_parallel_id=tp_id,
+                    peer_ids=self.peer_ids,
+                    thread_percentile=new_percentage,
+                )
+                workers.append(worker)
+                init_handlers.append(worker.ready.remote())
+            self.workers_back_up.append(workers)
+            
+        await asyncio.wait(init_handlers)
+    
     @classmethod
-    def collective_init_workers(cls, prefill_instance, decode_instance):
+    def collective_init_workers(cls, prefill_instance, decode_instance, prefill_thread_percentile, decode_thread_percentile):
         logger.info("Collective initialize workers")
 
         layer_per_placement_group = prefill_instance.model_config.get_num_layers() // len(prefill_instance.placement_groups)
@@ -170,61 +288,103 @@ class SingleStageLLMEngine(ABC):
         # create unique id
         pp_id_prefill = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
         pp_id_decode = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        pp_id_prefill_bak = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        pp_id_decode_bak = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+        pp_id_prefill_bak_1 = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+
         init_handlers = []
+
         for i in range(prefill_instance.parallel_config.pipeline_parallel_size):
             prefill_workers = []
             decode_workers = []
+            prefill_workers_back_up = []
+            prefill_workers_back_up_1 = []
+            decode_workers_back_up = []
             placement_group_index = i // pp_per_placement_group
             tp_id_prefill = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
             tp_id_decode = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+            tp_id_prefill_bak = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+            tp_id_decode_bak = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+            tp_id_prefill_bak_1 = copy.deepcopy(torch.ops.nccl_ops.generate_nccl_id())
+
             cur_placement_group = prefill_instance.placement_groups[placement_group_index]
+
+            initialized_workers_map = {}
             for j in range(prefill_instance.parallel_config.tensor_parallel_size):
                 tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
                 tmp_parallel_config.pipeline_parallel_rank = i
                 tmp_parallel_config.tensor_parallel_rank = j
-                prefill_worker = ParaWorker.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=cur_placement_group,
-                        placement_group_capture_child_tasks=True,
-                    )
-                ).remote(
-                    worker_id=(i*prefill_instance.parallel_config.tensor_parallel_size+j),
-                    stage=prefill_instance.stage,
-                    model_config=prefill_instance.model_config,
-                    cache_config=prefill_instance.cache_config,
-                    parallel_config=tmp_parallel_config,
-                    pipeline_parallel_id=pp_id_prefill,
-                    tensor_parallel_id=tp_id_prefill,
-                    peer_ids=prefill_instance.peer_ids,
-                )
-                prefill_workers.append(prefill_worker)
-                init_handlers.append(prefill_worker.ready.remote())
-                
-                tmp_parallel_config = copy.deepcopy(decode_instance.parallel_config)
+                # 2 prefill worker and 2 decode worker in one device
+                # this aims for dynamic cast mps SM partition percentage
+                for _ in range(5):
+                    worker = ParaWorker.options(
+                            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                                placement_group=cur_placement_group,
+                                placement_group_capture_child_tasks=True,
+                            )
+                        ).remote()
+                    gpu_id = ray.get(worker.get_device_id.remote())
+                    item = initialized_workers_map.get(gpu_id, [])
+                    item.append(worker)
+                    initialized_workers_map[gpu_id] = item
+            
+            gpu_ids = list(initialized_workers_map.keys())
+            
+            for j in range(prefill_instance.parallel_config.tensor_parallel_size):
+                tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
                 tmp_parallel_config.pipeline_parallel_rank = i
                 tmp_parallel_config.tensor_parallel_rank = j
-                decode_worker = ParaWorker.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=cur_placement_group,
-                        placement_group_capture_child_tasks=True,
+                for k in range(3):
+                    prefill_worker = initialized_workers_map[gpu_ids[j]][k]
+                    prefill_worker.init.remote(
+                        worker_id=(i*prefill_instance.parallel_config.tensor_parallel_size+j),
+                        stage=prefill_instance.stage,
+                        model_config=prefill_instance.model_config,
+                        cache_config=prefill_instance.cache_config,
+                        parallel_config=tmp_parallel_config,
+                        pipeline_parallel_id=pp_id_prefill if k ==0 else [pp_id_prefill_bak, pp_id_prefill_bak_1][k-1],
+                        tensor_parallel_id=tp_id_prefill if k ==0 else [tp_id_prefill_bak, tp_id_prefill_bak_1][k-1],
+                        peer_ids=prefill_instance.peer_ids,
+                        thread_percentile=prefill_thread_percentile,
                     )
-                ).remote(
-                    worker_id=(i*decode_instance.parallel_config.tensor_parallel_size+j),
-                    stage=decode_instance.stage,
-                    model_config=decode_instance.model_config,
-                    cache_config=decode_instance.cache_config,
-                    parallel_config=tmp_parallel_config,
-                    pipeline_parallel_id=pp_id_decode,
-                    tensor_parallel_id=tp_id_decode,
-                    peer_ids=decode_instance.peer_ids,
-                )
-                
-                decode_workers.append(decode_worker)
-                init_handlers.append(decode_worker.ready.remote())
+                    if k == 0:
+                        prefill_workers.append(prefill_worker)
+                    elif k == 1:
+                        prefill_workers_back_up.append(prefill_worker)
+                    else:
+                        prefill_workers_back_up_1.append(prefill_worker)
+                    init_handlers.append(prefill_worker.ready.remote())
+                for k in range(2):
+                    tmp_parallel_config = copy.deepcopy(decode_instance.parallel_config)
+                    tmp_parallel_config.pipeline_parallel_rank = i
+                    tmp_parallel_config.tensor_parallel_rank = j
+                    decode_worker = initialized_workers_map[gpu_ids[j]][k + 3]
+                    decode_worker.init.remote(
+                        worker_id=(i*decode_instance.parallel_config.tensor_parallel_size+j),
+                        stage=decode_instance.stage,
+                        model_config=decode_instance.model_config,
+                        cache_config=decode_instance.cache_config,
+                        parallel_config=tmp_parallel_config,
+                        pipeline_parallel_id=pp_id_decode if k == 0 else pp_id_decode_bak,
+                        tensor_parallel_id=tp_id_decode if k == 0 else tp_id_decode_bak,
+                        peer_ids=decode_instance.peer_ids,
+                        thread_percentile=decode_thread_percentile,
+                    )
+                    
+                    if k == 0:
+                        decode_workers.append(decode_worker)
+                    else:
+                        decode_workers_back_up.append(decode_worker)
+
+                    init_handlers.append(decode_worker.ready.remote())
             prefill_instance.workers.append(prefill_workers)
             decode_instance.workers.append(decode_workers)
             
-        # asyncio.wait(init_handlers)
+            prefill_instance.workers_back_up.append(prefill_workers_back_up)
+            decode_instance.workers_back_up.append(decode_workers_back_up)
+            
+            prefill_instance.workers_back_up_1.append(prefill_workers_back_up_1)
+
 
     async def _init_workers(self):
         """
@@ -271,11 +431,11 @@ class SingleStageLLMEngine(ABC):
             
         await asyncio.wait(init_handlers)
 
-    async def _init_model(self):
+    async def _init_model(self, bypass_weigit_init=False):
         """
         init model by call init_model() on all workers
         """
-        handlers = self._remote_call_all_workers_async("init_model")
+        handlers = self._remote_call_all_workers_async("init_model", bypass_weigit_init)
         await asyncio.wait(handlers)
 
     async def _init_kvcache(self, bypass_block_init=False):
@@ -299,13 +459,14 @@ class SingleStageLLMEngine(ABC):
             "init_kvcache_and_swap", num_gpu_blocks, num_cpu_blocks, bypass_block_init
         ))
         
-        # Gather the address of kv cache for block migration
-        self.kv_cache_mem_handles = []
-        for stage in self.workers:
-            kv_cache_mem_handles = []
-            for worker in stage:
-                kv_cache_mem_handles.append(kv_cache_mem_handles_1d.pop(0))
-            self.kv_cache_mem_handles.append(kv_cache_mem_handles)
+        if not bypass_block_init:
+            # Gather the address of kv cache for block migration
+            self.kv_cache_mem_handles = []
+            for stage in self.workers:
+                kv_cache_mem_handles = []
+                for worker in stage:
+                    kv_cache_mem_handles.append(kv_cache_mem_handles_1d.pop(0))
+                self.kv_cache_mem_handles.append(kv_cache_mem_handles)
         
         return num_gpu_blocks, num_cpu_blocks
 
@@ -329,28 +490,30 @@ class SingleStageLLMEngine(ABC):
         Distribute kv cache memory IPC handles to workers and workers will
         register those handles.
         """
-        self.weight_mem_handles = weight_mem_handles
+        self.flatten_weight_mem_handles = weight_mem_handles
         await asyncio.wait(self._remote_call_all_workers_async(
             "register_weight_mem_handles",
             context_parallel_config,
             weight_mem_handles
         ))
         
-    async def lazy_init_weight(self, enable_ipc_mem):
+    async def lazy_init_weight(self, enable_ipc_mem, is_alloc):
         """
         Distribute kv cache memory IPC handles to workers and workers will
         register those handles.
         """
         await asyncio.wait(self._remote_call_all_workers_async(
-            "lazy_init_weight", enable_ipc_mem
+            "lazy_init_weight", enable_ipc_mem, is_alloc
         ))
 
     def _remote_call_all_workers_async(self, func_name: str, *args):
         """
         call func_name asynchronously on all workers, return the futures immediately
         """
+        is_backup = WorkersManager.get()
         handlers = []
-        for stage in self.workers:
+        workers = self.workers if is_backup == 0 else self.workers_back_up
+        for stage in workers:
             for worker in stage:
                 handlers.append(getattr(worker, func_name).remote(*args))
         return handlers
@@ -374,7 +537,47 @@ class SingleStageLLMEngine(ABC):
     @abstractmethod
     async def print_engine_status(self):
         raise NotImplementedError()
-        
+    
+    async def register_kvcache_mem_handles(
+        self,
+        context_parallel_config: ParallelConfig,
+        kv_cache_mem_handles: List[List[Tuple[cudaMemoryIpcHandle, cudaMemoryIpcHandle]]]
+    ):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+        self.kv_cache_mem_handles = kv_cache_mem_handles
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "register_kvcache_mem_handles",
+            context_parallel_config,
+            kv_cache_mem_handles
+        ))
+    
+    async def get_shared_kv_tensor(self):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "get_shared_kv_tensor",
+        ))
+    
+    async def init_back_up_workers(self):
+        with WorkersContext(1):
+            await self._init_model(bypass_weigit_init=True)
+            await self._init_kvcache(bypass_block_init=True)
+            await self.register_kvcache_mem_handles(
+                self.parallel_config,
+                self.kv_cache_mem_handles
+            )
+            await self.register_weight_mem_handles(
+                self.parallel_config,
+                self.flatten_weight_mem_handles,
+            )
+            await self.lazy_init_weight(True, is_alloc=False)
+            await self.get_shared_kv_tensor()
     
 class ContextStageLLMEngine(SingleStageLLMEngine):
     def _get_scheduler(self) -> ContextStageScheduler:
@@ -414,9 +617,16 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         self.batches_ret_futures = []
         
         self.bridge_queue = bridge_queue
+        
+        self._decode_semaphore_call_back_fn = None
+        
+        self.ttft_window = []
     
     def add_request(self, request: Request):
         self.scheduler.add_request(request)
+    
+    def set_decode_semaphore_call_back(self, fn):
+        self._decode_semaphore_call_back_fn = fn
     
     def _free_request_resources(self, request_id: int, bypass):
         if not bypass:
@@ -507,7 +717,7 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 Prefill_TflopS = prefill_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
                 P_mfu =  Prefill_TflopS / 312
                 logger.info("promt run : tokens %d, batch %s, latency %s ms,  p_mfu %f, prefill_flops %f, pp %s, tp %s", total_tokens, batch_size, latency, P_mfu, prefill_flops, pp, tp)
-       
+                
                 generated_tokens = []
                 for gen_token_id in generated_tokens_ids:
                     try:
@@ -521,7 +731,13 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 finished_batch.finish_one_iteration(
                     generated_tokens, generated_tokens_ids, end_time
                 )
-                
+                ttft = (req.last_step_time - req.arrival_time) * 1e3
+                self.ttft_window.append(ttft)
+                # import numpy as np
+                # p90_ttft = np.percentile(np.array(self.ttft_window), 90)
+                # logger.info("promt run : ttft %f ms , p90_ttft %f ms, tokens %d, batch %s, latency %s ms,  p_mfu %f, prefill_flops %f, pp %s, tp %s", ttft, p90_ttft, total_tokens, batch_size, latency, P_mfu, prefill_flops, pp, tp)
+
+
                 self.scheduler.on_finish_requests(finished_batch)
                 
                 for request, new_token, new_token_id in zip(
@@ -554,6 +770,35 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                         self.bridge_queue.put_nowait(migrating_req) # This won't panic because the queue is unbounded
                     else:
                         self._free_request_resources(request.request_id, bypass=False)
+                        
+                logger.info("\033[1;32;40m Semaphore Queue=%s\033[0m", self.semaphore_queue)
+
+                # every 50 forward, detect p90 ttft once, to realize some adjustment
+                if self.step_count % 50 == 0:
+                    self.step_count = 0
+                    import numpy as np
+                    p90_ttft = np.percentile(np.array(self.ttft_window), 90)
+                    logger.info("ttft mark : %f", p90_ttft)
+                    #TODO(lufang,chen), add schedule algorithm
+                    
+                    # hack, for test adjust 
+                    # if p90_ttft > 80:
+                    #     self._decode_semaphore_call_back_fn(20)
+                    #     self.ttft_window = []
+                
+                self.step_count += 1
+                
+                # Currently don't adjust prefill percentage
+                # The following code only for verify switch functionally works
+                do_dynamic_switch = False
+                if self.switch_semaphore == SwitchSemaphore.REJECT:
+                    if do_dynamic_switch:
+                        self.switch_percentile = 100
+                        self.switch_semaphore = SwitchSemaphore.ACCEPT
+                logger.info("\033[1;32;40mcurrent semaphore is : %s\033[0m", self.switch_semaphore.__str__())
+                if self.switch_semaphore == SwitchSemaphore.END_INIT:
+                    await self.worker_switch()
+                    self.switch_semaphore = SwitchSemaphore.REJECT
     
     def clear_migrated_blocks_callback(self, migrated_request: MigratingRequest, bypass):
         """
@@ -561,7 +806,15 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         """
         self._free_request_resources(migrated_request.req.request_id, bypass)
         self.scheduler.on_request_migrated(migrated_request)
-        
+
+    
+    async def _switch_worker_with_semaphore(self):
+        if self.switch_semaphore == SwitchSemaphore.ACCEPT:
+            self.switch_semaphore = SwitchSemaphore.START_INIT
+            await self.restart_back_up_workers(self.switch_percentile)
+            await self.init_back_up_workers()
+            self.switch_semaphore = SwitchSemaphore.END_INIT
+      
     async def start_event_loop(self):
         async def event_loop1():
             while True:
@@ -572,11 +825,43 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
             while True:
                 # self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
+        
+        async def event_loop3():
+            while True:
+                await self._switch_worker_with_semaphore()
+                # await asyncio.sleep(1)
+                await asyncio.sleep(SLEEP_FOR_MPS_RESCHEDULE)
 
-        await asyncio.gather(event_loop1(), event_loop2())
+        await asyncio.gather(event_loop1(), event_loop2(), event_loop3())
         
     def print_engine_status(self):
         self.scheduler.print_status()
+        
+    async def register_kvcache_mem_handles(
+        self,
+        context_parallel_config: ParallelConfig,
+        kv_cache_mem_handles: List[List[Tuple[cudaMemoryIpcHandle, cudaMemoryIpcHandle]]]
+    ):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+        self.kv_cache_mem_handles = kv_cache_mem_handles
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "register_kvcache_mem_handles",
+            context_parallel_config,
+            kv_cache_mem_handles
+        ))
+    
+    async def get_shared_kv_tensor(self):
+        """
+        Distribute kv cache memory IPC handles to workers and workers will
+        register those handles.
+        """
+
+        await asyncio.wait(self._remote_call_all_workers_async(
+            "get_shared_kv_tensor",
+        ))
         
 
 class DecodingStageLLMEngine(SingleStageLLMEngine):
@@ -621,6 +906,11 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         self.batches_in_pipeline = []
         self.batches_ret_futures = []
         
+        self._prefill_semaphore_call_back_fn = None
+        
+    def set_prefill_semaphore_call_back(self, fn):
+        self._prefill_semaphore_call_back_fn = fn
+
     async def register_kvcache_mem_handles(
         self,
         context_parallel_config: ParallelConfig,
@@ -850,13 +1140,36 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 self._remote_call_all_workers_async(
                     "clear_request_resource_batched", finished_reqs
                 )
+                
+                # if self.step_count % 100 == 0:
+                #     self._prefill_semaphore_call_back_fn(100)
+                
+                do_dynamic_switch = bool(self.semaphore_queue.__len__() != 0)
+                logger.info("\033[1;32;40m Decode Semaphore Queue=%s\033[0m", self.semaphore_queue)
 
+                if self.switch_semaphore == SwitchSemaphore.REJECT:
+                    if do_dynamic_switch:
+                        self.switch_percentile = self.semaphore_queue.pop()
+                        self.switch_semaphore = SwitchSemaphore.ACCEPT
+                logger.info("\033[1;32;40m Decode semaphore is : %s\033[0m", self.switch_semaphore.__str__())
+                if self.switch_semaphore == SwitchSemaphore.END_INIT:
+                    await self.worker_switch()
+                    self.switch_semaphore = SwitchSemaphore.REJECT
+                
+                self.step_count += 1
                 # pop the finished batch
                 self.batches_in_pipeline.pop(0)
                 self.batches_ret_futures.pop(0)
 
         # proactive request migraion
         await self.scheduler.post_process()
+        
+    async def _switch_worker_with_semaphore(self):
+        if self.switch_semaphore == SwitchSemaphore.ACCEPT:
+            self.switch_semaphore = SwitchSemaphore.START_INIT
+            await self.restart_back_up_workers(self.switch_percentile)
+            await self.init_back_up_workers()
+            self.switch_semaphore = SwitchSemaphore.END_INIT
     
     async def start_event_loop(self):
         async def event_loop1():
@@ -877,8 +1190,15 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             while True:
                 self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
-                
-        await asyncio.gather(event_loop1(), event_loop2(), event_loop3())
+        
+        
+        async def event_loop4():
+            while True:
+                await self._switch_worker_with_semaphore()
+                # await asyncio.sleep(1)
+                await asyncio.sleep(SLEEP_FOR_MPS_RESCHEDULE)
+        
+        await asyncio.gather(event_loop1(), event_loop2(), event_loop3(), event_loop4())
     
     def print_engine_status(self):
         self.block_manager.print_block_usage()

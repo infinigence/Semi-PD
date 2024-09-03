@@ -29,7 +29,8 @@ from distserve.single_stage_engine import (
     StepOutput,
     ContextStageLLMEngine,
     DecodingStageLLMEngine,
-    SingleStageLLMEngine
+    SingleStageLLMEngine,
+    WorkersContext,
 )
 from distserve.lifetime import LifetimeEvent, LifetimeEventType
 
@@ -37,6 +38,8 @@ logger = init_logger(__name__)
 import os
 ENABLE_MPS = bool(os.getenv("ENABLE_MPS", False))
 logger.info("\033[1;32;40mENABLE MPS = %s\033[0m", ENABLE_MPS)
+CONTEXT_ENGINE_SM_PERCENTILE = int(os.getenv("CONTEXT_ENGINE_SM_PERCENTILE", 100))
+DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("DECODE_ENGINE_SM_PERCENTILE", 100))
 
 class LLMEngine:
     """
@@ -211,33 +214,42 @@ class LLMEngine:
             context_pp * context_tp + decoding_pp * decoding_tp
         
         # Create placement groups
-        resource_unit = { "GPU": 0.5 } if ENABLE_MPS else { "GPU": 1 }
+        # resource_unit = { "GPU": 0.5 } if ENABLE_MPS else { "GPU": 1 }
+        resource_unit = { "GPU": 0.25 } if ENABLE_MPS else { "GPU": 1 }
+
         placement_groups = []
         for i in range(num_placement_groups):
             placement_group = ray.util.placement_group(
-                [resource_unit] * workers_per_placement_group,
+                # [resource_unit] * workers_per_placement_group * 2,
                 # [ { "GPU": 1 }] * workers_per_placement_group,
+                [{ "CPU":1,"GPU": 0.20 }] * (workers_per_placement_group // 2 * 5),
                 strategy="STRICT_PACK",
             )
             ray.get(placement_group.ready(), timeout=1000)
             placement_groups.append(placement_group)
         
         return placement_groups
-        
+
     async def initialize(self):
         bypass_worker_init = False
         bypass_block_init = False
         enable_ipc_mem = False
+        bypass_weigit_init = False
         if ENABLE_MPS:
             bypass_worker_init = True
             bypass_block_init = True
             enable_ipc_mem = True
-        
+            bypass_weigit_init =True
+            
         
         if bypass_worker_init:
-            SingleStageLLMEngine.collective_init_workers(self.context_engine, self.decoding_engine)
+            SingleStageLLMEngine.collective_init_workers(self.context_engine, self.decoding_engine, CONTEXT_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE)
         await self.context_engine.initialize(bypass_worker_init=bypass_worker_init)
-        await self.decoding_engine.initialize(bypass_block_init=bypass_block_init, bypass_worker_init=bypass_worker_init)
+        await self.decoding_engine.initialize(bypass_block_init=bypass_block_init, bypass_worker_init=bypass_worker_init, bypass_weigit_init=bypass_weigit_init)
+
+        self.context_engine.set_decode_semaphore_call_back(self.decoding_engine.insert_semaphore)
+        self.decoding_engine.set_prefill_semaphore_call_back(self.context_engine.insert_semaphore)
+
         
         if bypass_worker_init:
             self.decoding_engine.set_block_manager(self.context_engine.get_block_manager())
@@ -253,7 +265,18 @@ class LLMEngine:
                 self.context_engine.parallel_config,
                 self.context_engine.flatten_weight_mem_handles,
             )
-        await self.decoding_engine.lazy_init_weight(enable_ipc_mem)
+        await self.decoding_engine.lazy_init_weight(enable_ipc_mem, is_alloc=False)
+        
+
+        await self.context_engine.init_back_up_workers()
+        await self.context_engine.set_persistent_worker()
+        
+        await self.context_engine.init_back_up_workers()
+        await self.context_engine.worker_switch()
+        
+        await self.decoding_engine.init_back_up_workers()
+        await self.decoding_engine.worker_switch()
+
         
         # bypass_block_init = True
         if bypass_block_init:
