@@ -22,14 +22,28 @@ logger = init_logger(__name__)
 # from ray._private.runtime_env.
 
 import os
-ENABLE_MPS = os.getenv("ENABLE_MPS", False)
+ENABLE_MPS = int(os.getenv("ENABLE_MPS", 0))
 CONTEXT_ENGINE_SM_PERCENTILE = int(os.getenv("CONTEXT_ENGINE_SM_PERCENTILE", 100))
 DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("DECODE_ENGINE_SM_PERCENTILE", 100))
+
+ENABLE_DYNAMIC_SWITCH = int(os.getenv("ENABLE_DYNAMIC_SWITCH", 0))
+logger.info("\033[1;32;40mENABLE MPS = %s\033[0m", ENABLE_MPS)
+logger.info("\033[1;32;40mENABLE_DYNAMIC_SWITCH=%s\033[0m", ENABLE_DYNAMIC_SWITCH)
+if ENABLE_MPS:
+    if ENABLE_DYNAMIC_SWITCH:
+        NUM_GPUS = 0.20
+    else:
+        NUM_GPUS = 0.50
+else:
+    NUM_GPUS = 1
 
 @ray.remote(num_cpus=0,
             # num_gpus=(0.5 if ENABLE_MPS else 1),
             # num_gpus=(0.25 if ENABLE_MPS else 1),
-            num_gpus=(0.20 if ENABLE_MPS else 1),
+            # num_gpus=(0.20 if ENABLE_MPS else 1),
+            num_gpus=NUM_GPUS,
+            runtime_env={"env_vars": {"ENABLE_MPS": str(ENABLE_MPS), 
+                                      "ENABLE_DYNAMIC_SWITCH": str(ENABLE_DYNAMIC_SWITCH)}}
             # num_gpus=1,
             # runtime_env={ "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "50"}
             # runtime_env={
@@ -90,6 +104,7 @@ class ParaWorker:
         #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(DECODE_ENGINE_SM_PERCENTILE))
         # os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(50))
         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(thread_percentile))
+        os.putenv("CUDA_LAUNCH_BLOCKING","1")
 
 
         # os.environ["NCCL_DEBUG"] = "INFO"      
@@ -127,7 +142,8 @@ class ParaWorker:
         
         
          # FSDP relative
-        self.decode_layers_num = self.model_config.hf_config.num_hidden_layers
+        # self.decode_layers_num = self.model_config.hf_config.num_hidden_layers
+        self.decode_layers_num = self.model_config.hf_config.num_hidden_layers // parallel_config.pipeline_parallel_size
         self.peer_ids = peer_ids
         self.peer_send_fn = None
         
@@ -168,7 +184,6 @@ class ParaWorker:
         self.model.recv_weight(layer_id)
         # self.model.wait_stream()
         
-    
 
     def ready(self):
         """
@@ -436,10 +451,11 @@ class ParaWorker:
             self.v_cache,
             block_table,
         )
-        # print(f"worker is context : {self.parallel_config.is_context}")
-        torch.cuda.synchronize()
+        # # print(f"worker is context : {self.parallel_config.is_context}")
+        # torch.cuda.synchronize()
         # if self.parallel_config.is_context == 1:
         for i in range(self.decode_layers_num):
+        # for i in range(1):
             # logger.info("layer %d forward", i)
             # self.model.nccl_group_start()
             # if self.parallel_config.is_context != 1:
@@ -447,6 +463,7 @@ class ParaWorker:
             #     self.model.nccl_group_start()
             #     self.recv_weight(i) # proc1
             #     self.model.nccl_group_end()
+            # breakpoint()
             self.model.execute_decoder_layer(i)
             # self.model.nccl_group_end()
             

@@ -31,15 +31,17 @@ from distserve.single_stage_engine import (
     DecodingStageLLMEngine,
     SingleStageLLMEngine,
     WorkersContext,
+    ENABLE_DYNAMIC_SWITCH,
 )
+from distserve.worker import ENABLE_MPS, CONTEXT_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE, ENABLE_DYNAMIC_SWITCH
 from distserve.lifetime import LifetimeEvent, LifetimeEventType
 
 logger = init_logger(__name__)
 import os
-ENABLE_MPS = bool(os.getenv("ENABLE_MPS", False))
-logger.info("\033[1;32;40mENABLE MPS = %s\033[0m", ENABLE_MPS)
-CONTEXT_ENGINE_SM_PERCENTILE = int(os.getenv("CONTEXT_ENGINE_SM_PERCENTILE", 100))
-DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("DECODE_ENGINE_SM_PERCENTILE", 100))
+# ENABLE_MPS = bool(os.getenv("ENABLE_MPS", 0))
+# logger.info("\033[1;32;40mENABLE MPS = %s\033[0m", ENABLE_MPS)
+# CONTEXT_ENGINE_SM_PERCENTILE = int(os.getenv("CONTEXT_ENGINE_SM_PERCENTILE", 100))
+# DECODE_ENGINE_SM_PERCENTILE = int(os.getenv("DECODE_ENGINE_SM_PERCENTILE", 100))
 
 class LLMEngine:
     """
@@ -215,14 +217,25 @@ class LLMEngine:
         
         # Create placement groups
         # resource_unit = { "GPU": 0.5 } if ENABLE_MPS else { "GPU": 1 }
-        resource_unit = { "GPU": 0.25 } if ENABLE_MPS else { "GPU": 1 }
+        resource_unit = { "GPU": 0.20} if ENABLE_MPS else { "GPU": 1 }
+        if not ENABLE_MPS:
+            resource_unit = { "GPU": 1 }
+            resources = [resource_unit] * workers_per_placement_group
+        else:
+            if ENABLE_DYNAMIC_SWITCH:
+                resource_unit = { "GPU": 0.20}
+                # divide 2 for peers p/d are in same device 
+                resources = [resource_unit] * (workers_per_placement_group // 2 * 5)
+
+            else:
+                resource_unit = { "GPU": 0.50}
+                resources = [resource_unit] * workers_per_placement_group
+
 
         placement_groups = []
         for i in range(num_placement_groups):
             placement_group = ray.util.placement_group(
-                # [resource_unit] * workers_per_placement_group * 2,
-                # [ { "GPU": 1 }] * workers_per_placement_group,
-                [{ "CPU":1,"GPU": 0.20 }] * (workers_per_placement_group // 2 * 5),
+                resources,
                 strategy="STRICT_PACK",
             )
             ray.get(placement_group.ready(), timeout=1000)
@@ -243,7 +256,7 @@ class LLMEngine:
             
         
         if bypass_worker_init:
-            SingleStageLLMEngine.collective_init_workers(self.context_engine, self.decoding_engine, CONTEXT_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE)
+            await SingleStageLLMEngine.collective_init_workers(self.context_engine, self.decoding_engine, CONTEXT_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE)
         await self.context_engine.initialize(bypass_worker_init=bypass_worker_init)
         await self.decoding_engine.initialize(bypass_block_init=bypass_block_init, bypass_worker_init=bypass_worker_init, bypass_weigit_init=bypass_weigit_init)
 
@@ -267,17 +280,17 @@ class LLMEngine:
             )
         await self.decoding_engine.lazy_init_weight(enable_ipc_mem, is_alloc=False)
         
+        if ENABLE_DYNAMIC_SWITCH:
+            await self.context_engine.init_back_up_workers()
+            await self.context_engine.set_persistent_worker()
+            
+            await self.context_engine.init_back_up_workers()
+            await self.context_engine.worker_switch()
+            
+            await self.decoding_engine.init_back_up_workers()
+            await self.decoding_engine.worker_switch()
 
-        await self.context_engine.init_back_up_workers()
-        await self.context_engine.set_persistent_worker()
-        
-        await self.context_engine.init_back_up_workers()
-        await self.context_engine.worker_switch()
-        
-        await self.decoding_engine.init_back_up_workers()
-        await self.decoding_engine.worker_switch()
 
-        
         # bypass_block_init = True
         if bypass_block_init:
             await self.decoding_engine.get_shared_kv_tensor()

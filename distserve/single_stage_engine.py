@@ -2,6 +2,7 @@ import time, copy
 from typing import Callable, Optional, List, Dict, Tuple
 from abc import ABC, abstractmethod
 import asyncio
+import os
 from enum import Enum
 import contextvars
 from contextlib import contextmanager
@@ -27,7 +28,7 @@ from distserve.utils import Counter, cudaMemoryIpcHandle, Stage
 from distserve.lifetime import LifetimeEvent, LifetimeEventType
 from distserve.tokenizer import get_tokenizer
 from distserve.block_manager import BlockManager
-from distserve.worker import ParaWorker
+from distserve.worker import ParaWorker, ENABLE_DYNAMIC_SWITCH
 from distserve.context_stage_scheduler import ContextStageSchedConfig, ContextStageScheduler, get_context_stage_scheduler
 from distserve.decoding_stage_scheduler import DecodingStageSchedConfig, DecodingStageScheduler, get_decoding_stage_scheduler
 
@@ -48,6 +49,9 @@ SLEEP_IN_EACH_EVENT_LOOP = 0
 PRINT_STATUS_INTERVAL = 1
 
 SLEEP_FOR_MPS_RESCHEDULE = 0.5
+
+# ENABLE_DYNAMIC_SWITCH = bool(os.getenv("ENABLE_DYNAMIC_SWITCH", 0))
+# logger.info("ENABLE_DYNAMIC_SWITCH=%s", ENABLE_DYNAMIC_SWITCH)
 
 # 创建一个上下文变量
 WorkersManager = contextvars.ContextVar('workers_manager', default=0)
@@ -279,7 +283,7 @@ class SingleStageLLMEngine(ABC):
         await asyncio.wait(init_handlers)
     
     @classmethod
-    def collective_init_workers(cls, prefill_instance, decode_instance, prefill_thread_percentile, decode_thread_percentile):
+    async def collective_init_workers(cls, prefill_instance, decode_instance, prefill_thread_percentile, decode_thread_percentile):
         logger.info("Collective initialize workers")
 
         layer_per_placement_group = prefill_instance.model_config.get_num_layers() // len(prefill_instance.placement_groups)
@@ -309,24 +313,33 @@ class SingleStageLLMEngine(ABC):
 
             cur_placement_group = prefill_instance.placement_groups[placement_group_index]
 
+            workers_num_per_device =  5 if ENABLE_DYNAMIC_SWITCH else 2
+            prefill_workers_num_per_device =  3 if ENABLE_DYNAMIC_SWITCH else 1
+            decode_workers_num_per_device =  2 if ENABLE_DYNAMIC_SWITCH else 1
+
             initialized_workers_map = {}
+            task_list = []
             for j in range(prefill_instance.parallel_config.tensor_parallel_size):
-                tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
-                tmp_parallel_config.pipeline_parallel_rank = i
-                tmp_parallel_config.tensor_parallel_rank = j
-                # 2 prefill worker and 2 decode worker in one device
-                # this aims for dynamic cast mps SM partition percentage
-                for _ in range(5):
-                    worker = ParaWorker.options(
-                            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                                placement_group=cur_placement_group,
-                                placement_group_capture_child_tasks=True,
-                            )
-                        ).remote()
-                    gpu_id = ray.get(worker.get_device_id.remote())
-                    item = initialized_workers_map.get(gpu_id, [])
-                    item.append(worker)
-                    initialized_workers_map[gpu_id] = item
+                async def _create_worker():
+                    tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
+                    tmp_parallel_config.pipeline_parallel_rank = i
+                    tmp_parallel_config.tensor_parallel_rank = j
+                    # 2 prefill worker and 2 decode worker in one device
+                    # this aims for dynamic cast mps SM partition percentage
+                    for _ in range(workers_num_per_device):
+                        worker = ParaWorker.options(
+                                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                                    placement_group=cur_placement_group,
+                                    placement_group_capture_child_tasks=True,
+                                )
+                            ).remote()
+                        gpu_id = ray.get(worker.get_device_id.remote())
+                        item = initialized_workers_map.get(gpu_id, [])
+                        item.append(worker)
+                        initialized_workers_map[gpu_id] = item
+                task_list.append(asyncio.create_task(_create_worker()))
+            
+            await asyncio.gather(*task_list)
             
             gpu_ids = list(initialized_workers_map.keys())
             
@@ -334,7 +347,7 @@ class SingleStageLLMEngine(ABC):
                 tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
                 tmp_parallel_config.pipeline_parallel_rank = i
                 tmp_parallel_config.tensor_parallel_rank = j
-                for k in range(3):
+                for k in range(prefill_workers_num_per_device):
                     prefill_worker = initialized_workers_map[gpu_ids[j]][k]
                     prefill_worker.init.remote(
                         worker_id=(i*prefill_instance.parallel_config.tensor_parallel_size+j),
@@ -354,11 +367,11 @@ class SingleStageLLMEngine(ABC):
                     else:
                         prefill_workers_back_up_1.append(prefill_worker)
                     init_handlers.append(prefill_worker.ready.remote())
-                for k in range(2):
+                for k in range(decode_workers_num_per_device):
                     tmp_parallel_config = copy.deepcopy(decode_instance.parallel_config)
                     tmp_parallel_config.pipeline_parallel_rank = i
                     tmp_parallel_config.tensor_parallel_rank = j
-                    decode_worker = initialized_workers_map[gpu_ids[j]][k + 3]
+                    decode_worker = initialized_workers_map[gpu_ids[j]][k + prefill_workers_num_per_device]
                     decode_worker.init.remote(
                         worker_id=(i*decode_instance.parallel_config.tensor_parallel_size+j),
                         stage=decode_instance.stage,
@@ -698,18 +711,18 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 
                     
                 end_time = time.time()
-                latency = (end_time - batched_requests.start_time) * 1e3
+                latency = (end_time - self.batches_in_pipeline[0].start_time) * 1e3
                 d = self.model_config.hf_config.hidden_size
                 l = self.model_config.hf_config.num_hidden_layers
-                batch_size = len(batched_requests.requests)
+                batch_size = len(self.batches_in_pipeline[0].requests)
                 # ffn_h = self.model_config.hf_config.ffn_dim
                 ffn_h = 4
                 h_scale = ffn_h / d
                 
                 bld = 1 * l * d
                 prefill_flops = 0
-                total_tokens = batched_requests.get_num_input_tokens()
-                for req in batched_requests.requests:
+                total_tokens = self.batches_in_pipeline[0].get_num_input_tokens()
+                for req in self.batches_in_pipeline[0].requests:
                     s = req.get_num_input_tokens()
                     prefill_flops += ((4 * s ** 2) + (8 + 4 * h_scale) * s * d) * bld
                 pp = self.parallel_config.pipeline_parallel_size
@@ -1085,12 +1098,12 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 logger.info("----------after-decode-forward--------")
                 self.block_manager.print_block_usage()
                 end_time = time.time()
-                latency = (end_time - batched_requests.start_time) * 1e3
+                latency = (end_time - self.batches_in_pipeline[0].start_time) * 1e3
                 
-                latency = (end_time - batched_requests.start_time) * 1e3
+                latency = (end_time - self.batches_in_pipeline[0].start_time) * 1e3
                 d = self.model_config.hf_config.hidden_size
                 l = self.model_config.hf_config.num_hidden_layers
-                batch_size = len(batched_requests.requests)
+                batch_size = len(self.batches_in_pipeline[0].requests)
                 # ffn_h = self.model_config.hf_config.ffn_dim
                 ffn_h = 4
                 h_scale = ffn_h / d
@@ -1098,7 +1111,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 bld = 1 * l * d
                 decode_flops = 0
                 total_tokens = batch_size
-                for req in batched_requests.requests:
+                for req in self.batches_in_pipeline[0].requests:
                     s = req.get_kvcache_slots()
                     decode_flops += (4 * s + (8 + 4 * h_scale) * 1 * d) * bld
 
