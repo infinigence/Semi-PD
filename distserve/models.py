@@ -50,6 +50,7 @@ def get_model_op(
             model_config.dtype,
             cache_config.block_size,
             cache_config.max_num_blocks_per_req,
+            False,
             parallel_config.to_list(),
         )
     raise NotImplementedError(f"model {model_name} not supported")

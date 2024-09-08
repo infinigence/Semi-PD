@@ -134,6 +134,7 @@ class ContextStageFCFSScheduler(ContextStageScheduler):
             """
             Check whether the request can be added to the current batch.
             """
+            avail_blocks  =  self.block_manager.get_num_avail_gpu_blocks()
             return (
                 # Limit 1. batch size
                 len(next_batch) < self.sched_config.max_batch_size
@@ -157,7 +158,7 @@ class ContextStageFCFSScheduler(ContextStageScheduler):
                 sum([
                     self._get_block_needed(len(req.prompt_token_ids))
                     for req in next_batch.requests + [request]
-                ])<= self.block_manager.get_num_avail_gpu_blocks()
+                ])<= avail_blocks and avail_blocks > self.block_manager.max_num_gpu_blocks * 0.05
             )
     
         while len(self.waiting_queue) > 0:
