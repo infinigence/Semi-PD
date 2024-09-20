@@ -3,6 +3,7 @@ from typing import Callable, Optional, List, Dict, Tuple
 from abc import ABC, abstractmethod
 import asyncio
 import os
+import numpy as np
 from enum import Enum
 import contextvars
 from contextlib import contextmanager
@@ -153,8 +154,11 @@ class SingleStageLLMEngine(ABC):
         
         self.switch_semaphore = SwitchSemaphore.REJECT
         self.switch_percentile = 100
+        self.sm_percentile = 100
         self.semaphore_queue = []
         self.step_count = 1
+        self.ttft_slo = 500
+        self.tpot_slo = 100
        
     def insert_semaphore(self, percentile):
         self.semaphore_queue.append(percentile)
@@ -634,7 +638,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         self._decode_semaphore_call_back_fn = None
         
         self.ttft_window = []
-    
+        self.wait_window = []
+        
     def add_request(self, request: Request):
         self.scheduler.add_request(request)
     
@@ -644,6 +649,73 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
     def _free_request_resources(self, request_id: int, bypass):
         if not bypass:
             super()._free_request_resources(request_id)
+            
+    def _sm_percentile_predict(self, cur_p90_latency, cur_p90_waiting, cur_sm_percentile, slo_ttft):
+        def _scale_waiting(sm_percentile):
+            if sm_percentile == 100:
+                return 1
+            inv_sm_p = 100 / sm_percentile
+            scale = 1.4046465674985547 * inv_sm_p ** 2 + -3.15935463280878 * inv_sm_p + 2.8734660485396604
+            return scale
+            
+        def _scale_latency(sm_percentile):
+            if sm_percentile == 100:
+                return 1
+            inv_sm_p = 100 / sm_percentile
+            scale =  0.732435017003385 * inv_sm_p + 0.3185253290850649
+            return scale
+        
+        base_latency_scale = _scale_latency(cur_sm_percentile)
+        base_waiting_scale = _scale_waiting(cur_sm_percentile)
+        interval = 2
+        ttft = cur_p90_waiting + cur_p90_latency
+        if slo_ttft <= ttft and cur_sm_percentile == 100:
+            logger.info("There is no room to adjust!!")
+            return 100
+
+        predicted_sm_percentile = cur_sm_percentile
+        # Currently, both to maximum tpot conditional
+        adjust_count = 0
+        max_step = 3
+        if slo_ttft < ttft:
+            while True and adjust_count < max_step:
+                # adjust to 100
+                predicted_sm_percentile += interval
+                adjust_count +=1
+                if predicted_sm_percentile >= 100:
+                    predicted_sm_percentile = 100
+                future_waiting_scale = _scale_waiting(predicted_sm_percentile)
+                future_latency_scale = _scale_latency(predicted_sm_percentile)
+                future_ttft = future_waiting_scale / base_waiting_scale * cur_p90_waiting + future_latency_scale / base_latency_scale * cur_p90_latency
+                # shortest step
+                if future_ttft <= slo_ttft:
+                    break
+                if predicted_sm_percentile == 100:
+                    logger.info("meet the upper bound, adjustment limited")
+                    break
+        elif slo_ttft > ttft:
+            while True and adjust_count < max_step:
+                # adjust to 40(hard lower bound)
+                predicted_sm_percentile -= interval
+                adjust_count +=1
+                if predicted_sm_percentile <= 40:
+                    predicted_sm_percentile = 40
+                future_waiting_scale = _scale_waiting(predicted_sm_percentile)
+                future_latency_scale = _scale_latency(predicted_sm_percentile)
+                future_ttft = future_waiting_scale / base_waiting_scale * cur_p90_waiting + future_latency_scale / base_latency_scale * cur_p90_latency
+                # longest step
+                if future_ttft > slo_ttft:
+                    predicted_sm_percentile += interval
+                    break
+                if predicted_sm_percentile == 40:
+                    logger.info("meet the lower bound, adjustment limited")
+                    break
+
+        else:
+            return cur_sm_percentile
+        
+        return predicted_sm_percentile
+
         
     async def _step(self):
         """
@@ -667,7 +739,7 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         else:
             logger.info(f"(context) Forwarding with lengths {[len(request.prompt_token_ids) for request in batched_requests.requests]}")
             # allocate blocks as needed
-            logger.info("----------before-prefill-forward--------")
+            # logger.info("----------before-prefill-forward--------")
             self.block_manager.print_block_usage()
             self.block_manager.allocate_blocks_batched(batched_requests)
             
@@ -706,8 +778,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
             else:
                 generated_tokens_ids = await self.batches_ret_futures[0]
                 
-                logger.info("----------after-prefill-forward--------")
-                self.block_manager.print_block_usage()
+                # logger.info("----------after-prefill-forward--------")
+                # self.block_manager.print_block_usage()
                 
                     
                 end_time = time.time()
@@ -722,14 +794,14 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 bld = 1 * l * d
                 prefill_flops = 0
                 total_tokens = self.batches_in_pipeline[0].get_num_input_tokens()
-                for req in self.batches_in_pipeline[0].requests:
-                    s = req.get_num_input_tokens()
-                    prefill_flops += ((4 * s ** 2) + (8 + 4 * h_scale) * s * d) * bld
-                pp = self.parallel_config.pipeline_parallel_size
-                tp = self.parallel_config.tensor_parallel_size
-                Prefill_TflopS = prefill_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
-                P_mfu =  Prefill_TflopS / 312
-                logger.info("promt run : tokens %d, batch %s, latency %s ms,  p_mfu %f, prefill_flops %f, pp %s, tp %s", total_tokens, batch_size, latency, P_mfu, prefill_flops, pp, tp)
+                # for req in self.batches_in_pipeline[0].requests:
+                #     s = req.get_num_input_tokens()
+                #     prefill_flops += ((4 * s ** 2) + (8 + 4 * h_scale) * s * d) * bld
+                # pp = self.parallel_config.pipeline_parallel_size
+                # tp = self.parallel_config.tensor_parallel_size
+                # Prefill_TflopS = prefill_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
+                # P_mfu =  Prefill_TflopS / 312
+                # logger.info("promt run : tokens %d, batch %s, latency %s ms,  p_mfu %f, prefill_flops %f, pp %s, tp %s", total_tokens, batch_size, latency, P_mfu, prefill_flops, pp, tp)
                 
                 generated_tokens = []
                 for gen_token_id in generated_tokens_ids:
@@ -744,11 +816,30 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 finished_batch.finish_one_iteration(
                     generated_tokens, generated_tokens_ids, end_time
                 )
-                ttft = (req.last_step_time - req.arrival_time) * 1e3
-                self.ttft_window.append(ttft)
-                # import numpy as np
+                # req_ttfts = []
+                # req_waitings = []
+                for req in self.batches_in_pipeline[0].requests:
+                    ttft = (req.last_step_time - req.arrival_time) * 1e3
+                    
+                    id = req.request_id
+                    # req_ttfts.append(ttft)
+                    waiting_latency = ttft - latency
+                    # self.ttft_window.append(waiting_latency)
+                    self.ttft_window.append((ttft, latency, waiting_latency))
+                    logger.info("Req-%s tokens %d batch_size %d total_batched_tokens %d: latency %f, waiting %f, ttft %f ms, ", id, len(req.prompt_token_ids), batch_size,total_tokens, latency, waiting_latency, ttft)
+
+                
+                import numpy as np
                 # p90_ttft = np.percentile(np.array(self.ttft_window), 90)
-                # logger.info("promt run : ttft %f ms , p90_ttft %f ms, tokens %d, batch %s, latency %s ms,  p_mfu %f, prefill_flops %f, pp %s, tp %s", ttft, p90_ttft, total_tokens, batch_size, latency, P_mfu, prefill_flops, pp, tp)
+                # p90_waiting = np.percentile(np.array(self.wait_window), 90)
+                # do_dynamic_switch = False
+                # self.ttft_window = sorted(self.ttft_window, key = lambda x:x[0])
+                # p90_idx = len(self.ttft_window) * 0.9 / 1 + 1
+                # logger.info("p90 ttft:%f", p90_ttft)
+                # req_ids = self.batches_in_pipeline[0].requests.get_request_ids()
+                
+                # logger.info("promt run : ttft %f ms , waiting_time %s ms, latency %s ms, p90_ttft %f ms, tokens %d, batch %s,  p_mfu %f, prefill_flops %f, pp %s, tp %s", ttft, waiting_time, latency, p90_ttft,  total_tokens, batch_size, P_mfu, prefill_flops, pp, tp)
+                # logger.info("promt run : ttft %f ms , waiting_time %s ms, latency %s ms, p90_ttft %f ms, tokens %d, batch %s,  p_mfu %f, prefill_flops %f, pp %s, tp %s", ttft, waiting_time, latency, p90_ttft,  total_tokens, batch_size, P_mfu, prefill_flops, pp, tp)
 
 
                 self.scheduler.on_finish_requests(finished_batch)
@@ -784,14 +875,28 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                     else:
                         self._free_request_resources(request.request_id, bypass=False)
                         
-                logger.info("\033[1;32;40m Semaphore Queue=%s\033[0m", self.semaphore_queue)
+                logger.info("\033[1;32;40m Prefill Semaphore Queue=%s\033[0m", self.semaphore_queue)
 
                 # every 50 forward, detect p90 ttft once, to realize some adjustment
-                if self.step_count % 50 == 0:
+                do_dynamic_switch = False
+                # if self.step_count % 1000 == 0 and self.switch_semaphore == SwitchSemaphore.REJECT:
+                if self.semaphore_queue.__len__() != 0:
+                    decode_cur_sm_percentile = self.semaphore_queue.pop()
                     self.step_count = 0
-                    import numpy as np
-                    p90_ttft = np.percentile(np.array(self.ttft_window), 90)
-                    logger.info("ttft mark : %f", p90_ttft)
+                    self.ttft_window = sorted(self.ttft_window, key = lambda x:x[0])
+                    p90_idx = int(len(self.ttft_window) * 0.9 / 1 + 1)
+                    p90_ttft, p90_latency, p90_waiting = self.ttft_window[p90_idx]
+                    adjust_sm_p = self._sm_percentile_predict(p90_latency, p90_waiting, self.sm_percentile, slo_ttft=300)
+                    logger.info("p90 ttft:%f", p90_ttft)
+                    logger.info("adjust_sm_p : %d", adjust_sm_p)
+                    if adjust_sm_p != self.sm_percentile:
+                        logger.info("\033[1;32;40m Prefill instance triggered switch %d->%d\033[0m",  self.sm_percentile,adjust_sm_p)
+                        self.switch_percentile = adjust_sm_p
+                        self.sm_percentile = adjust_sm_p
+                        do_dynamic_switch = True
+                    # clear window
+                    self.ttft_window = []
+                        
                     #TODO(lufang,chen), add schedule algorithm
                     
                     # hack, for test adjust 
@@ -803,14 +908,17 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 
                 # Currently don't adjust prefill percentage
                 # The following code only for verify switch functionally works
-                do_dynamic_switch = False
+                # do_dynamic_switch = False
+                
                 if self.switch_semaphore == SwitchSemaphore.REJECT:
                     if do_dynamic_switch:
-                        self.switch_percentile = 100
+                        # self.switch_percentile = 100
                         self.switch_semaphore = SwitchSemaphore.ACCEPT
-                logger.info("\033[1;32;40mcurrent semaphore is : %s\033[0m", self.switch_semaphore.__str__())
+                # logger.info("\033[1;32;40mcurrent semaphore is : %s\033[0m", self.switch_semaphore.__str__())
                 if self.switch_semaphore == SwitchSemaphore.END_INIT:
                     await self.worker_switch()
+                    # comm to decode instance switch finished
+                    self._decode_semaphore_call_back_fn(self.sm_percentile)
                     self.switch_semaphore = SwitchSemaphore.REJECT
     
     def clear_migrated_blocks_callback(self, migrated_request: MigratingRequest, bypass):
@@ -878,6 +986,7 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
         
 
 class DecodingStageLLMEngine(SingleStageLLMEngine):
+    
     def _get_scheduler(self) -> DecodingStageScheduler:
         return get_decoding_stage_scheduler(
             self.sched_config,
@@ -920,6 +1029,10 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         self.batches_ret_futures = []
         
         self._prefill_semaphore_call_back_fn = None
+        
+        self.topt_window = []
+        self.sm_percentile = 100
+        self.gather_info = True
         
     def set_prefill_semaphore_call_back(self, fn):
         self._prefill_semaphore_call_back_fn = fn
@@ -989,15 +1102,15 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         generated_token_ids_bkup = migrating_req.req.generated_token_ids
         migrating_req.req.generated_tokens = []
         migrating_req.req.generated_token_ids = []
-        logger.info("----------before-migrate_blocks--------")
-        self.block_manager.print_block_usage()
+        # logger.info("----------before-migrate_blocks--------")
+        # self.block_manager.print_block_usage()
         self.block_manager.allocate_blocks(migrating_req.req)
         migrating_req.req.generated_tokens = generated_token_bkup
         migrating_req.req.generated_token_ids = generated_token_ids_bkup
         
         target_block_indexes = self.block_manager.get_block_table(migrating_req.req.request_id)
         assert len(target_block_indexes) == len(migrating_req.block_indexes)
-        logger.info("target_block_indexes %s, \n migrate_block_indexes %s", target_block_indexes, migrating_req.block_indexes)
+        # logger.info("target_block_indexes %s, \n migrate_block_indexes %s", target_block_indexes, migrating_req.block_indexes)
         # bypass = True
         # bypass = False
         if not self.bypass_block_init:
@@ -1006,16 +1119,16 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 migrating_req.req.request_id,
                 LifetimeEvent(LifetimeEventType.MigrationBegin)
             )
-            logger.info("----------before-migrate_blocks--------")
-            self.block_manager.print_block_usage()
+            # logger.info("----------before-migrate_blocks--------")
+            # self.block_manager.print_block_usage()
             await asyncio.wait(self._remote_call_all_workers_async(
                 "migrate_blocks",
                 migrating_req.block_indexes,
                 migrating_req.context_parallel_config,
                 target_block_indexes
             ))
-            logger.info("----------after-migrate_blocks--------")
-            self.block_manager.print_block_usage()
+            # logger.info("----------after-migrate_blocks--------")
+            # self.block_manager.print_block_usage()
             self.engine_on_new_lifetime_event_callback(
                 migrating_req.req.request_id,
                 LifetimeEvent(LifetimeEventType.MigrationEnd)
@@ -1070,8 +1183,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             # push the batch into pipeline
             batched_requests.start_one_iteration(time.time())
             self.batches_in_pipeline.append(batched_requests)
-            logger.info("----------before-decode-forward--------")
-            self.block_manager.print_block_usage()
+            # logger.info("----------before-decode-forward--------")
+            # self.block_manager.print_block_usage()
             remote_calls = self._remote_call_all_workers_async(
                 "step",
                 batched_requests.get_request_ids(),
@@ -1095,8 +1208,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 self.batches_ret_futures.pop(0)
             else:
                 generated_tokens_ids = await self.batches_ret_futures[0]
-                logger.info("----------after-decode-forward--------")
-                self.block_manager.print_block_usage()
+                # logger.info("----------after-decode-forward--------")
+                # self.block_manager.print_block_usage()
                 end_time = time.time()
                 latency = (end_time - self.batches_in_pipeline[0].start_time) * 1e3
                 
@@ -1119,7 +1232,10 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 tp = self.parallel_config.tensor_parallel_size
                 Decode_TflopS = decode_flops / (latency * 1e-3) / (self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size) * 1e-12
                 P_mfu =  Decode_TflopS / 312
-                logger.info("decode run : tokens %d, batch %s, latency %s ms,  p_mfu %f, decode_flops %f, pp %s , tp %s is_context %s", total_tokens, batch_size, latency, P_mfu, decode_flops, pp, tp, self.parallel_config.is_context)
+                # logger.info("decode run : tokens %d, batch %s, latency %s ms,  p_mfu %f, decode_flops %f, pp %s , tp %s is_context %s", total_tokens, batch_size, latency, P_mfu, decode_flops, pp, tp, self.parallel_config.is_context)
+                # logger.info("batch_size %d, latency %d ms", batch_size, latency)
+                
+
                 generated_tokens = []
                 for gen_token_id in generated_tokens_ids:
                     try:
@@ -1129,11 +1245,13 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                         token = ""
                     generated_tokens.append(token)
 
-                finished_batch = self.batches_in_pipeline[0]
+                finished_batch : BatchedRequests = self.batches_in_pipeline[0]
                 finished_batch.finish_one_iteration(
                     generated_tokens, generated_tokens_ids, end_time
                 )
 
+                do_dynamic_switch = False
+                
                 for request, new_token, new_token_id in zip(
                     finished_batch.requests, generated_tokens, generated_tokens_ids
                 ):
@@ -1142,10 +1260,32 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                         StepOutput(request, new_token, new_token_id)
                     )
                     if request.is_finished:
+                        if self.semaphore_queue.__len__() != 0:
+                            prefill_cur_sm_percentile = self.semaphore_queue.pop()
+                            self.gather_info = True
+                        gen_len = len(request.generated_token_ids)
+                        tpot = request.process_time / gen_len
+                        if self.gather_info:
+                            self.topt_window.append(tpot)
+                        if len(self.topt_window) % 200 == 0 and len(self.topt_window) != 0:
+                            p90_tpot = np.percentile(np.array(self.topt_window), 90) * 1e3
+                            scale = 1.1
+                            condition = (p90_tpot * scale) > self.tpot_slo                            
+                            if condition :
+                                do_dynamic_switch = True
+                                self.gather_info = False
+                            # clear tpot window
+                            self.topt_window = []
+                            logger.info("Monitored P90 tpot: %f", p90_tpot)
+                            
+                        # import numpy as np
+                        # p90_tpot = np.percentile(np.array(self.topt_window), 90)
+                        # logger.info("len %dd, P95 tpot: %f",len(self.topt_window), p90_tpot)
                         self.engine_on_new_lifetime_event_callback(
                             request.request_id,
                             LifetimeEvent(LifetimeEventType.DecodingEnd)
                         )
+                
                 finished_reqs = self.scheduler.pop_finished_requests()
 
                 # free blocks for finished requests
@@ -1154,17 +1294,22 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                     "clear_request_resource_batched", finished_reqs
                 )
                 
-                # if self.step_count % 100 == 0:
-                #     self._prefill_semaphore_call_back_fn(100)
+                if do_dynamic_switch:
+                # if True:
+                    # currently only adjust prefill instance SMs, because the tpot period always take larger
+                    # percentile in whole inference period.
+                    # Give prefill instance a signal to do dynamic swich
+                    self._prefill_semaphore_call_back_fn(self.sm_percentile)
                 
-                do_dynamic_switch = bool(self.semaphore_queue.__len__() != 0)
-                logger.info("\033[1;32;40m Decode Semaphore Queue=%s\033[0m", self.semaphore_queue)
+                do_dynamic_switch = False
+                # do_dynamic_switch = bool(self.semaphore_queue.__len__() != 0)
+                # logger.info("\033[1;32;40m Decode Semaphore Queue=%s\033[0m", self.semaphore_queue)
 
                 if self.switch_semaphore == SwitchSemaphore.REJECT:
                     if do_dynamic_switch:
                         self.switch_percentile = self.semaphore_queue.pop()
                         self.switch_semaphore = SwitchSemaphore.ACCEPT
-                logger.info("\033[1;32;40m Decode semaphore is : %s\033[0m", self.switch_semaphore.__str__())
+                # logger.info("\033[1;32;40m Decode semaphore is : %s\033[0m", self.switch_semaphore.__str__())
                 if self.switch_semaphore == SwitchSemaphore.END_INIT:
                     await self.worker_switch()
                     self.switch_semaphore = SwitchSemaphore.REJECT
@@ -1201,7 +1346,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         async def event_loop3():
             # Event loop 3. Print engine status
             while True:
-                self.print_engine_status()
+                # self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
         
         
