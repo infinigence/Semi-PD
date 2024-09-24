@@ -429,13 +429,13 @@ class ParaWorker:
         start = time.time()
         # print(f"Worker {self.stage}.#{self.worker_id} Step begin")
         # run forward
-        # generated_tokens_ids = self.model.forward(
-        #     input_tokens_batched,
-        #     first_token_indexes,
-        #     self.k_cache,
-        #     self.v_cache,
-        #     block_table,
-        # )
+        generated_tokens_ids = self.model.forward(
+            input_tokens_batched,
+            first_token_indexes,
+            self.k_cache,
+            self.v_cache,
+            block_table,
+        )
         # generated_tokens_ids = self.model.pipelined_forward(
         #     input_tokens_batched,
         #     first_token_indexes,
@@ -444,30 +444,30 @@ class ParaWorker:
         #     block_table,
         # )
         
-        self.model.prologue(
-            input_tokens_batched,
-            first_token_indexes,
-            self.k_cache,
-            self.v_cache,
-            block_table,
-        )
-        # # print(f"worker is context : {self.parallel_config.is_context}")
-        # torch.cuda.synchronize()
-        # if self.parallel_config.is_context == 1:
-        for i in range(self.decode_layers_num):
-        # for i in range(1):
-            # logger.info("layer %d forward", i)
-            # self.model.nccl_group_start()
-            # if self.parallel_config.is_context != 1:
-            #     self.call_peer_send_fn(i) # proc 0
-            #     self.model.nccl_group_start()
-            #     self.recv_weight(i) # proc1
-            #     self.model.nccl_group_end()
-            # breakpoint()
-            self.model.execute_decoder_layer(i)
-            # self.model.nccl_group_end()
+        # self.model.prologue(
+        #     input_tokens_batched,
+        #     first_token_indexes,
+        #     self.k_cache,
+        #     self.v_cache,
+        #     block_table,
+        # )
+        # # # print(f"worker is context : {self.parallel_config.is_context}")
+        # # torch.cuda.synchronize()
+        # # if self.parallel_config.is_context == 1:
+        # for i in range(self.decode_layers_num):
+        # # for i in range(1):
+        #     # logger.info("layer %d forward", i)
+        #     # self.model.nccl_group_start()
+        #     # if self.parallel_config.is_context != 1:
+        #     #     self.call_peer_send_fn(i) # proc 0
+        #     #     self.model.nccl_group_start()
+        #     #     self.recv_weight(i) # proc1
+        #     #     self.model.nccl_group_end()
+        #     # breakpoint()
+        #     self.model.execute_decoder_layer(i)
+        #     # self.model.nccl_group_end()
             
-        generated_tokens_ids = self.model.epilogue()
+        # generated_tokens_ids = self.model.epilogue()
         
         self.execution_time += time.time() - start
         # print(f"Worker {self.stage}.#{self.worker_id} Step end")
