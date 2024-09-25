@@ -9,6 +9,7 @@ from distserve.logger import init_logger
 from distserve.request import Request, BatchedRequests, MigratingRequest
 from distserve.profiling import ProfilingDatabase
 from distserve.block_manager import BlockManager, BlockLocation
+from distserve.worker import ENABLE_MPS
 
 logger = init_logger(__name__)
 
@@ -132,13 +133,12 @@ class DecodingStageFCFSScheduler(DecodingStageScheduler):
         return (length + block_size - 1) // block_size
         
     def _check_add_to_cur_batch(self, request: Request) -> bool:
-        return (
-            len(self.batch_queues[self.cur_index]) < self.sched_config.max_batch_size
-        ) and (
-            self.batch_queues[self.cur_index].get_num_input_tokens()
-            + request.get_num_input_tokens()
-            <= self.sched_config.max_tokens_per_batch
-        ) and (
+        # condition 0:
+        cond_0 = len(self.batch_queues[self.cur_index]) < self.sched_config.max_batch_size
+        # condition 1:
+        cond_1 = self.batch_queues[self.cur_index].get_num_input_tokens() + request.get_num_input_tokens() <= self.sched_config.max_tokens_per_batch
+        # condition 2:
+        cond_2 = (
             sum([
                 sum([
                     self._get_block_needed(len(req.prompt_token_ids) + req.get_output_len())
@@ -151,6 +151,30 @@ class DecodingStageFCFSScheduler(DecodingStageScheduler):
             ]) + self._get_block_needed(request.get_input_len() + request.get_output_len()) \
                 <= self.block_manager.max_num_gpu_blocks
         )
+        
+        can_add =  all([cond_0, cond_1, cond_2])
+        return can_add
+        
+        
+        # return (
+        #     len(self.batch_queues[self.cur_index]) < self.sched_config.max_batch_size
+        # ) and (
+        #     self.batch_queues[self.cur_index].get_num_input_tokens()
+        #     + request.get_num_input_tokens()
+        #     <= self.sched_config.max_tokens_per_batch
+        # ) and (
+        #     sum([
+        #         sum([
+        #             self._get_block_needed(len(req.prompt_token_ids) + req.get_output_len())
+        #             for req in self.batch_queues[index].requests
+        #         ])
+        #         for index in range(self.parallel_config.pipeline_parallel_size)
+        #     ]) + sum([
+        #         self._get_block_needed(len(req.prompt_token_ids))
+        #         for req in self.waiting_queue
+        #     ]) + self._get_block_needed(request.get_input_len() + request.get_output_len()) \
+        #         <= self.block_manager.max_num_gpu_blocks
+        # )
 
     # Requests-related methods
     async def add_request(self, migrating_req: MigratingRequest) -> None:
@@ -223,7 +247,10 @@ class DecodingStageFCFSScheduler(DecodingStageScheduler):
                     self.waiting_queue.pop(0)
                 else:
                     break
+        if len(self.batch_queues[self.cur_index]) != 0:
+            self.block_manager.allocate_blocks_batched(self.batch_queues[self.cur_index])
         return self.batch_queues[self.cur_index]
+
 
     # Getter functions
     def get_total_num_requests(self) -> int:
@@ -261,7 +288,12 @@ class DecodingStageFCFSScheduler(DecodingStageScheduler):
                 self.waiting_queue.append(migrating_req.req)
             else:
                 break
-    
+
+if ENABLE_MPS:
+    from .unified_stage_scheduler import _check_add_to_cur_batch, get_next_batch
+    DecodingStageFCFSScheduler._check_add_to_cur_batch = _check_add_to_cur_batch
+    DecodingStageFCFSScheduler.get_next_batch = get_next_batch
+
 def get_decoding_stage_scheduler(
     sched_config: DecodingStageSchedConfig,
     parallel_config: ParallelConfig,

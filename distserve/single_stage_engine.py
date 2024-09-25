@@ -740,8 +740,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
             logger.info(f"(context) Forwarding with lengths {[len(request.prompt_token_ids) for request in batched_requests.requests]}")
             # allocate blocks as needed
             # logger.info("----------before-prefill-forward--------")
-            self.block_manager.print_block_usage()
-            self.block_manager.allocate_blocks_batched(batched_requests)
+            # self.block_manager.print_block_usage()
+            # self.block_manager.allocate_blocks_batched(batched_requests)
             
             # Log down the lifetime event
             for request in batched_requests.requests:
@@ -880,22 +880,23 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                 # every 50 forward, detect p90 ttft once, to realize some adjustment
                 do_dynamic_switch = False
                 # if self.step_count % 1000 == 0 and self.switch_semaphore == SwitchSemaphore.REJECT:
-                if self.semaphore_queue.__len__() != 0:
-                    decode_cur_sm_percentile = self.semaphore_queue.pop()
-                    self.step_count = 0
-                    self.ttft_window = sorted(self.ttft_window, key = lambda x:x[0])
-                    p90_idx = int(len(self.ttft_window) * 0.9 / 1 + 1)
-                    p90_ttft, p90_latency, p90_waiting = self.ttft_window[p90_idx]
-                    adjust_sm_p = self._sm_percentile_predict(p90_latency, p90_waiting, self.sm_percentile, slo_ttft=300)
-                    logger.info("p90 ttft:%f", p90_ttft)
-                    logger.info("adjust_sm_p : %d", adjust_sm_p)
-                    if adjust_sm_p != self.sm_percentile:
-                        logger.info("\033[1;32;40m Prefill instance triggered switch %d->%d\033[0m",  self.sm_percentile,adjust_sm_p)
-                        self.switch_percentile = adjust_sm_p
-                        self.sm_percentile = adjust_sm_p
-                        do_dynamic_switch = True
-                    # clear window
-                    self.ttft_window = []
+                if ENABLE_DYNAMIC_SWITCH:
+                    if self.semaphore_queue.__len__() != 0:
+                        decode_cur_sm_percentile = self.semaphore_queue.pop()
+                        self.step_count = 0
+                        self.ttft_window = sorted(self.ttft_window, key = lambda x:x[0])
+                        p90_idx = int(len(self.ttft_window) * 0.9 / 1 + 1)
+                        p90_ttft, p90_latency, p90_waiting = self.ttft_window[p90_idx]
+                        adjust_sm_p = self._sm_percentile_predict(p90_latency, p90_waiting, self.sm_percentile, slo_ttft=300)
+                        logger.info("p90 ttft:%f", p90_ttft)
+                        logger.info("adjust_sm_p : %d", adjust_sm_p)
+                        if adjust_sm_p != self.sm_percentile:
+                            logger.info("\033[1;32;40m Prefill instance triggered switch %d->%d\033[0m",  self.sm_percentile,adjust_sm_p)
+                            self.switch_percentile = adjust_sm_p
+                            self.sm_percentile = adjust_sm_p
+                            do_dynamic_switch = True
+                        # clear window
+                        self.ttft_window = []
                         
                     #TODO(lufang,chen), add schedule algorithm
                     
@@ -1173,7 +1174,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                 )
                 
             # Allocate blocks as needed
-            self.block_manager.allocate_blocks_batched(batched_requests)
+            # self.block_manager.allocate_blocks_batched(batched_requests)
 
             # Check if all requests are on GPU (i.e. not swapped out)
             assert self.block_manager.is_all_requests_on_gpu(
@@ -1260,23 +1261,24 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                         StepOutput(request, new_token, new_token_id)
                     )
                     if request.is_finished:
-                        if self.semaphore_queue.__len__() != 0:
-                            prefill_cur_sm_percentile = self.semaphore_queue.pop()
-                            self.gather_info = True
-                        gen_len = len(request.generated_token_ids)
-                        tpot = request.process_time / gen_len
-                        if self.gather_info:
-                            self.topt_window.append(tpot)
-                        if len(self.topt_window) % 200 == 0 and len(self.topt_window) != 0:
-                            p90_tpot = np.percentile(np.array(self.topt_window), 90) * 1e3
-                            scale = 1.1
-                            condition = (p90_tpot * scale) > self.tpot_slo                            
-                            if condition :
-                                do_dynamic_switch = True
-                                self.gather_info = False
-                            # clear tpot window
-                            self.topt_window = []
-                            logger.info("Monitored P90 tpot: %f", p90_tpot)
+                        if ENABLE_DYNAMIC_SWITCH:
+                            if self.semaphore_queue.__len__() != 0:
+                                prefill_cur_sm_percentile = self.semaphore_queue.pop()
+                                self.gather_info = True
+                            gen_len = len(request.generated_token_ids)
+                            tpot = request.process_time / gen_len
+                            if self.gather_info:
+                                self.topt_window.append(tpot)
+                            if len(self.topt_window) % 200 == 0 and len(self.topt_window) != 0:
+                                p90_tpot = np.percentile(np.array(self.topt_window), 90) * 1e3
+                                scale = 1.1
+                                condition = (p90_tpot * scale) > self.tpot_slo                            
+                                if condition :
+                                    do_dynamic_switch = True
+                                    self.gather_info = False
+                                # clear tpot window
+                                self.topt_window = []
+                                logger.info("Monitored P90 tpot: %f", p90_tpot)
                             
                         # import numpy as np
                         # p90_tpot = np.percentile(np.array(self.topt_window), 90)
@@ -1346,7 +1348,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         async def event_loop3():
             # Event loop 3. Print engine status
             while True:
-                # self.print_engine_status()
+                self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
         
         

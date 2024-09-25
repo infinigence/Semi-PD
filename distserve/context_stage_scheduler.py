@@ -6,6 +6,7 @@ from distserve.config import ContextStageSchedConfig, ParallelConfig
 from distserve.logger import init_logger
 from distserve.request import Request, BatchedRequests, MigratingRequest
 from distserve.block_manager import BlockManager
+from distserve.worker import ENABLE_MPS
 
 logger = init_logger(__name__)
 
@@ -123,51 +124,59 @@ class ContextStageFCFSScheduler(ContextStageScheduler):
     def _get_block_needed(self, length: int):
         block_size = self.block_manager.cache_config.block_size
         return (length + block_size - 1) // block_size
-            
+    
+    def _check_add_to_cur_batch(self, next_batch: BatchedRequests, request: Request) -> bool:
+        """
+        Check whether the request can be added to the current batch.
+        """
+        avail_blocks  =  self.block_manager.get_num_avail_gpu_blocks()
+        # Limit 1. batch size
+        cond_0 =  len(next_batch) < self.sched_config.max_batch_size
+        cond_1 = (
+            # Limit 2. tokens per batch
+            next_batch.get_num_input_tokens()
+            + request.get_num_input_tokens()
+            <= self.sched_config.max_tokens_per_batch
+        )
+        cond_2 = (
+            # # Limit 3. GPU blocks
+            # sum([
+            #     self._get_block_needed(len(req.prompt_token_ids))
+            #     for req in next_batch.requests + [request]
+            # ]) +
+            # sum([
+            #     self._get_block_needed(len(req.prompt_token_ids))
+            #     for req in self.unaccepted_queue
+            # ]) +
+            # self.num_on_fly_request_block 
+            # <= self.block_manager.max_num_gpu_blocks * 0.9
+            sum([
+                self._get_block_needed(len(req.prompt_token_ids))
+                for req in next_batch.requests + [request]
+            ])<= avail_blocks and avail_blocks > self.block_manager.max_num_gpu_blocks * 0.05
+        )
+        can_add = all([cond_0, cond_1, cond_2])
+        if can_add:
+            self.block_manager.allocate_blocks(request)
+        return can_add
+        
     def get_next_batch_and_pop(self) -> BatchedRequests:
         """
         Get the next batch for the context stage in a FCFS-like manner, and pop them
         """
         next_batch = BatchedRequests()
-
-        def _check_add_to_cur_batch(request: Request) -> bool:
-            """
-            Check whether the request can be added to the current batch.
-            """
-            avail_blocks  =  self.block_manager.get_num_avail_gpu_blocks()
-            return (
-                # Limit 1. batch size
-                len(next_batch) < self.sched_config.max_batch_size
-            ) and (
-                # Limit 2. tokens per batch
-                next_batch.get_num_input_tokens()
-                + request.get_num_input_tokens()
-                <= self.sched_config.max_tokens_per_batch
-            ) and (
-                # # Limit 3. GPU blocks
-                # sum([
-                #     self._get_block_needed(len(req.prompt_token_ids))
-                #     for req in next_batch.requests + [request]
-                # ]) +
-                # sum([
-                #     self._get_block_needed(len(req.prompt_token_ids))
-                #     for req in self.unaccepted_queue
-                # ]) +
-                # self.num_on_fly_request_block 
-                # <= self.block_manager.max_num_gpu_blocks * 0.9
-                sum([
-                    self._get_block_needed(len(req.prompt_token_ids))
-                    for req in next_batch.requests + [request]
-                ])<= avail_blocks and avail_blocks > self.block_manager.max_num_gpu_blocks * 0.05
-            )
     
         while len(self.waiting_queue) > 0:
             request = self.waiting_queue[0]
-            if _check_add_to_cur_batch(request):
+            if self._check_add_to_cur_batch(next_batch, request):
                 next_batch.add_request(request)
                 self.waiting_queue.pop(0)
             else:
                 break
+        
+        # if len(next_batch.requests) != 0:
+        #     self.block_manager.print_block_usage()
+        #     self.block_manager.allocate_blocks_batched(next_batch)
         
         # num_blocks = sum([
         #     self._get_block_needed(req.get_input_len())
@@ -210,6 +219,10 @@ class ContextStageFCFSScheduler(ContextStageScheduler):
     
     def print_status(self):
         logger.info(f"(context) {len(self.waiting_queue)} waiting, {len(self.unaccepted_queue)} finished but unaccepted, {self.num_on_fly_request_block} blocks occupied by on-the-fly requests")
+if ENABLE_MPS:
+    from .unified_stage_scheduler import _check_add_to_cur_batch, get_next_batch_and_pop
+    ContextStageFCFSScheduler._check_add_to_cur_batch = _check_add_to_cur_batch
+    ContextStageFCFSScheduler.get_next_batch_and_pop = get_next_batch_and_pop
 
 def get_context_stage_scheduler(
     sched_config: ContextStageSchedConfig,
