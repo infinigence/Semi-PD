@@ -98,6 +98,208 @@ class SwitchSemaphore(Enum):
     def __str__(self) -> str:
         return self.value
     
+class DynamicPartitioner():
+    def __init__(self, tpot_window: List, ttft_window: List, prefill_sm_percentile: int, decode_sm_percentile: int):
+        self.tpot_window = tpot_window
+        self.ttft_window = ttft_window
+        self.prefill_cur_sm_percentile = prefill_sm_percentile
+        self.decode_cur_sm_percentile = decode_sm_percentile
+        self.prefill_future_sm_percentile = prefill_sm_percentile
+        self.decode_future_sm_percentile = decode_sm_percentile
+        
+        # hyper params
+        self.window_size = 200
+        self.tpot_scale = 1.1
+        
+        # SLA
+        self.ttft_slo = 500
+        self.tpot_slo = 100
+        
+        # semaphore
+        self.do_prefill_replan = False
+        self.prefill_switch_status = None
+
+        
+        self.do_decode_replan = False
+        self.decode_switch_status = None
+    
+    def update_prefill_status(self, status):
+        self.prefill_switch_status = status
+    
+    def update_decode_status(self, status):
+        self.decode_switch_status = status
+    
+    def update_decode_info(self, tpot):
+        if not self.do_prefill_replan and self.prefill_switch_status == SwitchSemaphore.REJECT:
+            self.tpot_window.append(tpot)
+
+    def update_prefill_info(self, prefill_info):
+        if not self.do_prefill_replan and self.prefill_switch_status == SwitchSemaphore.REJECT:
+            self.ttft_window.append(prefill_info)
+
+    def check_switch_decode(self):
+        return self.do_decode_replan
+    
+    def check_switch_prefill(self):
+        return self.do_prefill_replan
+    
+    def get_decode_predicted_sm(self):
+        return self.decode_future_sm_percentile
+    
+    def get_prefill_predicted_sm(self):
+        return self.prefill_future_sm_percentile
+
+    def replan(self):
+        def _scale_tpot(sm_percentile):
+            if sm_percentile == 100:
+                return 1
+            inv_sm_p = 100 / sm_percentile
+            scale =  0.6099164272415375 * inv_sm_p + 0.41530605763705736
+            return scale
+        
+        def _scale_waiting(sm_percentile):
+            if sm_percentile == 100:
+                return 1
+            inv_sm_p = 100 / sm_percentile
+            scale = 1.4046465674985547 * inv_sm_p ** 2 + -3.15935463280878 * inv_sm_p + 2.8734660485396604
+            return scale
+            
+        def _scale_latency(sm_percentile):
+            if sm_percentile == 100:
+                return 1
+            inv_sm_p = 100 / sm_percentile
+            scale =  0.732435017003385 * inv_sm_p + 0.3185253290850649
+            return scale
+        
+        # Switch in progress
+        if self.do_prefill_replan or self.do_decode_replan:
+            return False
+        
+        # every (windows size amount) reqs check once
+        if not self.tpot_window.__len__() >= self.window_size:
+            return False
+        
+        p90_tpot = np.percentile(self.tpot_window, 90)
+        # clean tpot
+        self.tpot_window.clear()
+
+        if self.ttft_window.__len__() != 0:
+            ttft_window = sorted(self.ttft_window, key = lambda x:x[0])
+            p90_idx = int(len(ttft_window) * 0.9 / 1 + 1)
+            p90_ttft, p90_latency, p90_waiting = ttft_window[p90_idx]
+            self.ttft_window.clear()
+        else:
+            p90_ttft, p90_latency, p90_waiting = (-1, -1, -1)
+        
+        cond_tpot = p90_tpot * self.tpot_scale <= self.tpot_slo
+        cond_ttft = p90_ttft <= self.ttft_slo
+        
+        logger.info("\033[1;32;40m p90_TTFT:%f p90_TPOT %f\033[0m",  p90_ttft, p90_tpot)
+        
+        # Since both cannot be satisfied, just maximize mfu
+        if not cond_tpot and not cond_ttft and (self.prefill_cur_sm_percentile != 100 and self.decode_cur_sm_percentile !=100):
+            self.decode_future_sm_percentile = 100
+            self.prefill_future_sm_percentile = 100
+            self.do_decode_replan = True
+            self.do_prefill_replan = True
+            return True
+        
+        interval = 2
+        adjust_count = 0
+        max_step = 3
+        # First to check tpot constraint
+        if not cond_tpot and cond_ttft:
+            # adjust decode sm
+            if self.decode_cur_sm_percentile < 100:
+                predicted_sm_percentile = self.decode_cur_sm_percentile
+                base_tpot_scale = _scale_tpot(self.decode_cur_sm_percentile)
+                while True and adjust_count < max_step:
+                    # adjust to 100
+                    predicted_sm_percentile += interval
+                    adjust_count +=1
+                    if predicted_sm_percentile >= 100:
+                        predicted_sm_percentile = 100
+                    future_tpot_scale = _scale_tpot(predicted_sm_percentile)
+                    future_tpot = future_tpot_scale / base_tpot_scale * p90_tpot
+                    # shortest step
+                    if future_tpot <= self.tpot_slo:
+                        break
+                    if predicted_sm_percentile == 100:
+                        logger.info("meet the upper bound, adjustment limited")
+                        break
+                self.decode_future_sm_percentile = predicted_sm_percentile
+                self.do_decode_replan = True
+                return True
+            # slo_ttft > ttft
+            else:
+                predicted_sm_percentile = self.prefill_cur_sm_percentile
+                while True and adjust_count < max_step:
+                    # adjust to 40(hard lower bound)
+                    base_latency_scale = _scale_latency(self.prefill_cur_sm_percentile)
+                    base_waiting_scale = _scale_waiting(self.prefill_cur_sm_percentile)
+                    predicted_sm_percentile -= interval
+                    adjust_count +=1
+                    if predicted_sm_percentile <= 40:
+                        predicted_sm_percentile = 40
+                    future_waiting_scale = _scale_waiting(predicted_sm_percentile)
+                    future_latency_scale = _scale_latency(predicted_sm_percentile)
+                    future_ttft = future_waiting_scale / base_waiting_scale * p90_waiting + future_latency_scale / base_latency_scale * p90_latency
+                    # longest step
+                    if future_ttft > self.ttft_slo:
+                        predicted_sm_percentile += interval
+                        break
+                    if predicted_sm_percentile == 40:
+                        logger.info("meet the lower bound, adjustment limited")
+                        break
+                self.prefill_future_sm_percentile = predicted_sm_percentile
+                self.do_prefill_replan = True
+                return True
+        
+        if cond_tpot and not cond_ttft:
+            if self.prefill_cur_sm_percentile < 100:
+                predicted_sm_percentile = self.prefill_cur_sm_percentile
+                while True and adjust_count < max_step:
+                    base_latency_scale = _scale_latency(self.prefill_cur_sm_percentile)
+                    base_waiting_scale = _scale_waiting(self.prefill_cur_sm_percentile)
+                    # adjust to 100
+                    predicted_sm_percentile += interval
+                    adjust_count +=1
+                    if predicted_sm_percentile >= 100:
+                        predicted_sm_percentile = 100
+                    future_waiting_scale = _scale_waiting(predicted_sm_percentile)
+                    future_latency_scale = _scale_latency(predicted_sm_percentile)
+                    future_ttft = future_waiting_scale / base_waiting_scale * p90_waiting + future_latency_scale / base_latency_scale * p90_latency
+                    # shortest step
+                    if future_ttft <= self.ttft_slo:
+                        break
+                    if predicted_sm_percentile == 100:
+                        logger.info("meet the upper bound, adjustment limited")
+                        break
+                self.prefill_future_sm_percentile = predicted_sm_percentile
+                self.do_prefill_replan = True
+                return True
+            else:
+                predicted_sm_percentile = self.decode_cur_sm_percentile
+                while True and adjust_count < max_step:
+                    base_tpot_scale = _scale_tpot(self.decode_cur_sm_percentile)
+                    # adjust to 60(hard lower bound)
+                    predicted_sm_percentile -= interval
+                    adjust_count +=1
+                    if predicted_sm_percentile <= 60:
+                        predicted_sm_percentile = 60
+                    future_tpot_scale = _scale_tpot(predicted_sm_percentile)
+                    future_tpot = future_tpot_scale / base_tpot_scale * p90_tpot
+                    # longest step
+                    if future_tpot > self.tpot_slo:
+                        predicted_sm_percentile += interval
+                        break
+                    if predicted_sm_percentile == 60:
+                        logger.info("meet the lower bound, adjustment limited")
+                        break
+                self.decode_future_sm_percentile = predicted_sm_percentile
+                self.do_decode_replan = True
+                return True
+    
 class SingleStageLLMEngine(ABC):
     """
     SingleStageLLMEngine: An LLMEngine that runs either the context stage or the decoding stage.
@@ -159,7 +361,11 @@ class SingleStageLLMEngine(ABC):
         self.step_count = 1
         self.ttft_slo = 500
         self.tpot_slo = 100
-       
+        self.dyn_partitioner : DynamicPartitioner = None
+    
+    def set_dyn_partitioner(self, dyn_partitioner):
+        self.dyn_partitioner = dyn_partitioner
+    
     def insert_semaphore(self, percentile):
         self.semaphore_queue.append(percentile)
          
@@ -649,72 +855,7 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
     def _free_request_resources(self, request_id: int, bypass):
         if not bypass:
             super()._free_request_resources(request_id)
-            
-    def _sm_percentile_predict(self, cur_p90_latency, cur_p90_waiting, cur_sm_percentile, slo_ttft):
-        def _scale_waiting(sm_percentile):
-            if sm_percentile == 100:
-                return 1
-            inv_sm_p = 100 / sm_percentile
-            scale = 1.4046465674985547 * inv_sm_p ** 2 + -3.15935463280878 * inv_sm_p + 2.8734660485396604
-            return scale
-            
-        def _scale_latency(sm_percentile):
-            if sm_percentile == 100:
-                return 1
-            inv_sm_p = 100 / sm_percentile
-            scale =  0.732435017003385 * inv_sm_p + 0.3185253290850649
-            return scale
-        
-        base_latency_scale = _scale_latency(cur_sm_percentile)
-        base_waiting_scale = _scale_waiting(cur_sm_percentile)
-        interval = 2
-        ttft = cur_p90_waiting + cur_p90_latency
-        if slo_ttft <= ttft and cur_sm_percentile == 100:
-            logger.info("There is no room to adjust!!")
-            return 100
 
-        predicted_sm_percentile = cur_sm_percentile
-        # Currently, both to maximum tpot conditional
-        adjust_count = 0
-        max_step = 3
-        if slo_ttft < ttft:
-            while True and adjust_count < max_step:
-                # adjust to 100
-                predicted_sm_percentile += interval
-                adjust_count +=1
-                if predicted_sm_percentile >= 100:
-                    predicted_sm_percentile = 100
-                future_waiting_scale = _scale_waiting(predicted_sm_percentile)
-                future_latency_scale = _scale_latency(predicted_sm_percentile)
-                future_ttft = future_waiting_scale / base_waiting_scale * cur_p90_waiting + future_latency_scale / base_latency_scale * cur_p90_latency
-                # shortest step
-                if future_ttft <= slo_ttft:
-                    break
-                if predicted_sm_percentile == 100:
-                    logger.info("meet the upper bound, adjustment limited")
-                    break
-        elif slo_ttft > ttft:
-            while True and adjust_count < max_step:
-                # adjust to 40(hard lower bound)
-                predicted_sm_percentile -= interval
-                adjust_count +=1
-                if predicted_sm_percentile <= 40:
-                    predicted_sm_percentile = 40
-                future_waiting_scale = _scale_waiting(predicted_sm_percentile)
-                future_latency_scale = _scale_latency(predicted_sm_percentile)
-                future_ttft = future_waiting_scale / base_waiting_scale * cur_p90_waiting + future_latency_scale / base_latency_scale * cur_p90_latency
-                # longest step
-                if future_ttft > slo_ttft:
-                    predicted_sm_percentile += interval
-                    break
-                if predicted_sm_percentile == 40:
-                    logger.info("meet the lower bound, adjustment limited")
-                    break
-
-        else:
-            return cur_sm_percentile
-        
-        return predicted_sm_percentile
 
         
     async def _step(self):
@@ -825,7 +966,8 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                     # req_ttfts.append(ttft)
                     waiting_latency = ttft - latency
                     # self.ttft_window.append(waiting_latency)
-                    self.ttft_window.append((ttft, latency, waiting_latency))
+                    # self.ttft_window.append((ttft, latency, waiting_latency))
+                    self.dyn_partitioner.update_prefill_info((ttft, latency, waiting_latency))
                     logger.info("Req-%s tokens %d batch_size %d total_batched_tokens %d: latency %f, waiting %f, ttft %f ms, ", id, len(req.prompt_token_ids), batch_size,total_tokens, latency, waiting_latency, ttft)
 
                 
@@ -875,51 +1017,23 @@ class ContextStageLLMEngine(SingleStageLLMEngine):
                     else:
                         self._free_request_resources(request.request_id, bypass=False)
                         
-                logger.info("\033[1;32;40m Prefill Semaphore Queue=%s\033[0m", self.semaphore_queue)
-
-                # every 50 forward, detect p90 ttft once, to realize some adjustment
                 do_dynamic_switch = False
-                # if self.step_count % 1000 == 0 and self.switch_semaphore == SwitchSemaphore.REJECT:
                 if ENABLE_DYNAMIC_SWITCH:
-                    if self.semaphore_queue.__len__() != 0:
-                        decode_cur_sm_percentile = self.semaphore_queue.pop()
-                        self.step_count = 0
-                        self.ttft_window = sorted(self.ttft_window, key = lambda x:x[0])
-                        p90_idx = int(len(self.ttft_window) * 0.9 / 1 + 1)
-                        p90_ttft, p90_latency, p90_waiting = self.ttft_window[p90_idx]
-                        adjust_sm_p = self._sm_percentile_predict(p90_latency, p90_waiting, self.sm_percentile, slo_ttft=300)
-                        logger.info("p90 ttft:%f", p90_ttft)
-                        logger.info("adjust_sm_p : %d", adjust_sm_p)
-                        if adjust_sm_p != self.sm_percentile:
-                            logger.info("\033[1;32;40m Prefill instance triggered switch %d->%d\033[0m",  self.sm_percentile,adjust_sm_p)
-                            self.switch_percentile = adjust_sm_p
-                            self.sm_percentile = adjust_sm_p
-                            do_dynamic_switch = True
-                        # clear window
-                        self.ttft_window = []
-                        
-                    #TODO(lufang,chen), add schedule algorithm
-                    
-                    # hack, for test adjust 
-                    # if p90_ttft > 80:
-                    #     self._decode_semaphore_call_back_fn(20)
-                    #     self.ttft_window = []
-                
-                self.step_count += 1
-                
-                # Currently don't adjust prefill percentage
-                # The following code only for verify switch functionally works
-                # do_dynamic_switch = False
+                    self.dyn_partitioner.update_prefill_status(self.switch_semaphore)
+                    do_dynamic_switch = self.dyn_partitioner.check_switch_prefill()
                 
                 if self.switch_semaphore == SwitchSemaphore.REJECT:
                     if do_dynamic_switch:
                         # self.switch_percentile = 100
+                        self.switch_percentile = self.dyn_partitioner.get_prefill_predicted_sm()
+                        logger.info("\033[1;32;40m Prefill instance triggered switch %d->%d\033[0m",  self.sm_percentile,self.switch_percentile)
                         self.switch_semaphore = SwitchSemaphore.ACCEPT
-                # logger.info("\033[1;32;40mcurrent semaphore is : %s\033[0m", self.switch_semaphore.__str__())
                 if self.switch_semaphore == SwitchSemaphore.END_INIT:
                     await self.worker_switch()
-                    # comm to decode instance switch finished
-                    self._decode_semaphore_call_back_fn(self.sm_percentile)
+                    self.dyn_partitioner.prefill_cur_sm_percentile = self.switch_percentile
+                    self.sm_percentile = self.switch_percentile
+                    # reset
+                    self.dyn_partitioner.do_prefill_replan = False
                     self.switch_semaphore = SwitchSemaphore.REJECT
     
     def clear_migrated_blocks_callback(self, migrated_request: MigratingRequest, bypass):
@@ -1032,7 +1146,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         self._prefill_semaphore_call_back_fn = None
         
         self.topt_window = []
-        self.sm_percentile = 100
+        # self.sm_percentile = 100
         self.gather_info = True
         
     def set_prefill_semaphore_call_back(self, fn):
@@ -1080,7 +1194,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         #     super()._free_request_resources(request_id)
         self.request_events.pop(request_id)
         self.request_outputs.pop(request_id)
-        
+
     async def _migrate_blocks(
         self,
         migrating_req: MigratingRequest
@@ -1253,6 +1367,8 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
 
                 do_dynamic_switch = False
                 
+                self.dyn_partitioner.update_decode_status(self.switch_semaphore)
+                
                 for request, new_token, new_token_id in zip(
                     finished_batch.requests, generated_tokens, generated_tokens_ids
                 ):
@@ -1261,28 +1377,14 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                         StepOutput(request, new_token, new_token_id)
                     )
                     if request.is_finished:
+                        gen_len = len(request.generated_token_ids)
+                        tpot = request.process_time / gen_len
+                        logger.info("Req-%s tpot %f ms, ", request.request_id, tpot)
                         if ENABLE_DYNAMIC_SWITCH:
-                            if self.semaphore_queue.__len__() != 0:
-                                prefill_cur_sm_percentile = self.semaphore_queue.pop()
-                                self.gather_info = True
                             gen_len = len(request.generated_token_ids)
-                            tpot = request.process_time / gen_len
-                            if self.gather_info:
-                                self.topt_window.append(tpot)
-                            if len(self.topt_window) % 200 == 0 and len(self.topt_window) != 0:
-                                p90_tpot = np.percentile(np.array(self.topt_window), 90) * 1e3
-                                scale = 1.1
-                                condition = (p90_tpot * scale) > self.tpot_slo                            
-                                if condition :
-                                    do_dynamic_switch = True
-                                    self.gather_info = False
-                                # clear tpot window
-                                self.topt_window = []
-                                logger.info("Monitored P90 tpot: %f", p90_tpot)
-                            
-                        # import numpy as np
-                        # p90_tpot = np.percentile(np.array(self.topt_window), 90)
-                        # logger.info("len %dd, P95 tpot: %f",len(self.topt_window), p90_tpot)
+                            tpot = (request.process_time / gen_len) * 1e3
+                            self.dyn_partitioner.update_decode_info(tpot)
+
                         self.engine_on_new_lifetime_event_callback(
                             request.request_id,
                             LifetimeEvent(LifetimeEventType.DecodingEnd)
@@ -1296,24 +1398,21 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                     "clear_request_resource_batched", finished_reqs
                 )
                 
-                if do_dynamic_switch:
-                # if True:
-                    # currently only adjust prefill instance SMs, because the tpot period always take larger
-                    # percentile in whole inference period.
-                    # Give prefill instance a signal to do dynamic swich
-                    self._prefill_semaphore_call_back_fn(self.sm_percentile)
+                self.dyn_partitioner.replan()
+                do_dynamic_switch = self.dyn_partitioner.check_switch_decode()
                 
-                do_dynamic_switch = False
-                # do_dynamic_switch = bool(self.semaphore_queue.__len__() != 0)
-                # logger.info("\033[1;32;40m Decode Semaphore Queue=%s\033[0m", self.semaphore_queue)
 
                 if self.switch_semaphore == SwitchSemaphore.REJECT:
                     if do_dynamic_switch:
-                        self.switch_percentile = self.semaphore_queue.pop()
+                        self.switch_percentile = self.dyn_partitioner.get_decode_predicted_sm()
+                        logger.info("\033[1;32;40m Decode instance triggered switch %d->%d\033[0m",  self.sm_percentile,self.switch_percentile)
                         self.switch_semaphore = SwitchSemaphore.ACCEPT
-                # logger.info("\033[1;32;40m Decode semaphore is : %s\033[0m", self.switch_semaphore.__str__())
                 if self.switch_semaphore == SwitchSemaphore.END_INIT:
                     await self.worker_switch()
+                    self.dyn_partitioner.decode_cur_sm_percentile = self.switch_percentile
+                    self.sm_percentile = self.switch_percentile
+                    # reset
+                    self.dyn_partitioner.do_decode_replan = False
                     self.switch_semaphore = SwitchSemaphore.REJECT
                 
                 self.step_count += 1
@@ -1348,7 +1447,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         async def event_loop3():
             # Event loop 3. Print engine status
             while True:
-                self.print_engine_status()
+                # self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
         
         
@@ -1363,4 +1462,3 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
     def print_engine_status(self):
         self.block_manager.print_block_usage()
         self.scheduler.print_status()
-        

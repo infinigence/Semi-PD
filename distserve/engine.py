@@ -32,6 +32,7 @@ from distserve.single_stage_engine import (
     SingleStageLLMEngine,
     WorkersContext,
     ENABLE_DYNAMIC_SWITCH,
+    DynamicPartitioner
 )
 from distserve.worker import ENABLE_MPS, CONTEXT_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE, ENABLE_DYNAMIC_SWITCH
 from distserve.lifetime import LifetimeEvent, LifetimeEventType
@@ -263,6 +264,10 @@ class LLMEngine:
         self.context_engine.set_decode_semaphore_call_back(self.decoding_engine.insert_semaphore)
         self.decoding_engine.set_prefill_semaphore_call_back(self.context_engine.insert_semaphore)
 
+        dyn_patitioner = DynamicPartitioner(self.decoding_engine.topt_window, self.context_engine.ttft_window, CONTEXT_ENGINE_SM_PERCENTILE, DECODE_ENGINE_SM_PERCENTILE)
+        self.context_engine.set_dyn_partitioner(dyn_patitioner)
+        self.decoding_engine.set_dyn_partitioner(dyn_patitioner)
+        
         
         if bypass_worker_init:
             self.decoding_engine.set_block_manager(self.context_engine.get_block_manager())
