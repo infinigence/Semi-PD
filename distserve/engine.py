@@ -203,6 +203,7 @@ class LLMEngine:
         # Each placement group is responsible for `layer_per_placement_group` layers
         layer_per_context_pp = self.model_config.get_num_layers(self.disagg_parallel_config.context)
         layer_per_decoding_pp = self.model_config.get_num_layers(self.disagg_parallel_config.decoding)
+        assert layer_per_context_pp == layer_per_decoding_pp
         
         layer_per_placement_group = math.lcm(layer_per_context_pp, layer_per_decoding_pp)
         
@@ -212,7 +213,7 @@ class LLMEngine:
             + layer_per_placement_group // layer_per_decoding_pp * decoding_tp
         
         # There should be `num_placement_groups` placement groups in total
-        num_placement_groups = self.model_config.get_num_layers() // layer_per_placement_group
+        num_placement_groups = (self.model_config.get_num_layers() + layer_per_context_pp - 1)  // layer_per_placement_group
         assert num_placement_groups * workers_per_placement_group == \
             context_pp * context_tp + decoding_pp * decoding_tp
         

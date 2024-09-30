@@ -5,6 +5,9 @@ from transformers import AutoConfig
 
 from distserve.utils import GB
 
+from distserve.logger import init_logger
+logger = init_logger(__name__)
+
 
 class CacheConfig:
     """Configuration for the key-value cache.
@@ -283,12 +286,26 @@ class ModelConfig:
 
     def get_num_layers(self, parallel_config: ParallelConfig = ParallelConfig()) -> int:
         total_num_hidden_layers = self.hf_config.num_hidden_layers
-        assert total_num_hidden_layers % parallel_config.pipeline_parallel_size == 0, (
-            f"Number of layers ({total_num_hidden_layers}) must be divisible "
-            f"by the size of pipeline parallel group "
-            f"({parallel_config.pipeline_parallel_size})."
-        )
-        return total_num_hidden_layers // parallel_config.pipeline_parallel_size
+        # assert total_num_hidden_layers % parallel_config.pipeline_parallel_size == 0, (
+        #     f"Number of layers ({total_num_hidden_layers}) must be divisible "
+        #     f"by the size of pipeline parallel group "
+        #     f"({parallel_config.pipeline_parallel_size})."
+        # )
+        if total_num_hidden_layers % parallel_config.pipeline_parallel_size == 0:
+            return total_num_hidden_layers // parallel_config.pipeline_parallel_size
+        else:
+            base_num_layers = total_num_hidden_layers // parallel_config.pipeline_parallel_size
+            gap_num_layers = total_num_hidden_layers - base_num_layers * parallel_config.pipeline_parallel_size
+            if parallel_config.pipeline_parallel_rank < gap_num_layers:
+                
+                fixed_num_layers = base_num_layers + 1
+            else:
+                fixed_num_layers = base_num_layers
+            msg = f"""Number of layers ({total_num_hidden_layers}) cannot be divided
+            by the size of pipeline parallel group  ({parallel_config.pipeline_parallel_size}), 
+            round-robin dispatch to the stages, current PP={parallel_config.pipeline_parallel_rank}, num_layers={fixed_num_layers}"""
+            logger.warning(msg)
+            return fixed_num_layers
 
     def get_model_size_in_bytes(
         self, parallel_config: ParallelConfig = ParallelConfig()

@@ -496,7 +496,7 @@ class SingleStageLLMEngine(ABC):
     async def collective_init_workers(cls, prefill_instance, decode_instance, prefill_thread_percentile, decode_thread_percentile):
         logger.info("Collective initialize workers")
 
-        layer_per_placement_group = prefill_instance.model_config.get_num_layers() // len(prefill_instance.placement_groups)
+        layer_per_placement_group = (prefill_instance.model_config.get_num_layers() + len(prefill_instance.placement_groups) - 1)// len(prefill_instance.placement_groups)
         layer_per_pp = prefill_instance.model_config.get_num_layers(prefill_instance.parallel_config)
         pp_per_placement_group = layer_per_placement_group // layer_per_pp
         # create unique id

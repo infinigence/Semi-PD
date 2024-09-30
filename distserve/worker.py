@@ -143,7 +143,9 @@ class ParaWorker:
         
          # FSDP relative
         # self.decode_layers_num = self.model_config.hf_config.num_hidden_layers
-        self.decode_layers_num = self.model_config.hf_config.num_hidden_layers // parallel_config.pipeline_parallel_size
+        # self.decode_layers_num = self.model_config.hf_config.num_hidden_layers // parallel_config.pipeline_parallel_size
+        self.decode_layers_num = self.model_config.get_num_layers(self.parallel_config)
+
         self.peer_ids = peer_ids
         self.peer_send_fn = None
         
@@ -261,6 +263,8 @@ class ParaWorker:
         #     kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
         # )
         # if self.parallel_config.is_context == 1:
+        pp_rank = self.parallel_config.pipeline_parallel_rank
+        tp_rank = self.parallel_config.tensor_parallel_rank
         if not bypass_block_init:
             self.k_cache = torch.empty(
                 kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
@@ -268,7 +272,7 @@ class ParaWorker:
             self.v_cache = torch.empty(
                 kv_cache_shape, dtype=self.model_config.get_torch_dtype(), device="cuda"
             )
-            logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} alloc kv cache, shape={kv_cache_shape}\033[0m")
+            logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} alloc kv cache, (PP={pp_rank}, TP={tp_rank}) shape={kv_cache_shape}\033[0m")
 
         else:
             logger.info(f"\033[1;32;40mWorker {self.stage}.#{self.worker_id} in gpu #{self.gpu_id} use shared kv cache tensor\033[0m")
@@ -488,7 +492,7 @@ class ParaWorker:
                 torch.ops.block_migration_ops.register_ipc_mem_handle(
                     kvcache_ipc_mem_handles[pp_rank][tp_rank][0],
                     kvcache_ipc_mem_handles[pp_rank][tp_rank][1],
-                    self.model_config.get_num_layers(),
+                    self.model_config.get_num_layers(tmp_parallel_config),
                     self.model_config.get_num_heads(),
                     tmp_parallel_config.to_list(),
                     self.parallel_config.to_list()
