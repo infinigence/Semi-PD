@@ -97,7 +97,15 @@ class SwitchSemaphore(Enum):
 
     def __str__(self) -> str:
         return self.value
-    
+
+
+TTFT_SLO  =  int(
+    os.getenv("TTFT_SLO", 500))  # noqa
+TPOT_SLO  =  int(
+    os.getenv("TPOT_SLO", 100))  # noqa
+
+logger.info("\033[1;32;40mTTFT_SLO=%s TPOT_SLO=%s\033[0m", TTFT_SLO, TPOT_SLO)
+
 class DynamicPartitioner():
     def __init__(self, tpot_window: List, ttft_window: List, prefill_sm_percentile: int, decode_sm_percentile: int):
         self.tpot_window = tpot_window
@@ -108,12 +116,12 @@ class DynamicPartitioner():
         self.decode_future_sm_percentile = decode_sm_percentile
         
         # hyper params
-        self.window_size = 200
+        self.window_size = 400
         self.tpot_scale = 1.1
         
         # SLA
-        self.ttft_slo = 500
-        self.tpot_slo = 100
+        self.ttft_slo = TTFT_SLO
+        self.tpot_slo = TPOT_SLO
         
         # semaphore
         self.do_prefill_replan = False
@@ -239,8 +247,8 @@ class DynamicPartitioner():
                     base_waiting_scale = _scale_waiting(self.prefill_cur_sm_percentile)
                     predicted_sm_percentile -= interval
                     adjust_count +=1
-                    if predicted_sm_percentile <= 40:
-                        predicted_sm_percentile = 40
+                    if predicted_sm_percentile <= 80:
+                        predicted_sm_percentile = 80
                     future_waiting_scale = _scale_waiting(predicted_sm_percentile)
                     future_latency_scale = _scale_latency(predicted_sm_percentile)
                     future_ttft = future_waiting_scale / base_waiting_scale * p90_waiting + future_latency_scale / base_latency_scale * p90_latency
@@ -248,7 +256,7 @@ class DynamicPartitioner():
                     if future_ttft > self.ttft_slo:
                         predicted_sm_percentile += interval
                         break
-                    if predicted_sm_percentile == 40:
+                    if predicted_sm_percentile == 80:
                         logger.info("meet the lower bound, adjustment limited")
                         break
                 self.prefill_future_sm_percentile = predicted_sm_percentile
@@ -285,15 +293,15 @@ class DynamicPartitioner():
                     # adjust to 60(hard lower bound)
                     predicted_sm_percentile -= interval
                     adjust_count +=1
-                    if predicted_sm_percentile <= 60:
-                        predicted_sm_percentile = 60
+                    if predicted_sm_percentile <= 80:
+                        predicted_sm_percentile = 80
                     future_tpot_scale = _scale_tpot(predicted_sm_percentile)
                     future_tpot = future_tpot_scale / base_tpot_scale * p90_tpot
                     # longest step
                     if future_tpot > self.tpot_slo:
                         predicted_sm_percentile += interval
                         break
-                    if predicted_sm_percentile == 60:
+                    if predicted_sm_percentile == 80:
                         logger.info("meet the lower bound, adjustment limited")
                         break
                 self.decode_future_sm_percentile = predicted_sm_percentile
@@ -1378,7 +1386,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
                     )
                     if request.is_finished:
                         gen_len = len(request.generated_token_ids)
-                        tpot = request.process_time / gen_len
+                        tpot = (request.process_time / gen_len) * 1e3
                         logger.info("Req-%s tpot %f ms, ", request.request_id, tpot)
                         if ENABLE_DYNAMIC_SWITCH:
                             gen_len = len(request.generated_token_ids)
@@ -1447,7 +1455,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         async def event_loop3():
             # Event loop 3. Print engine status
             while True:
-                # self.print_engine_status()
+                self.print_engine_status()
                 await asyncio.sleep(PRINT_STATUS_INTERVAL)
         
         
