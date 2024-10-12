@@ -111,9 +111,16 @@ async def async_request_vllm(
             async with session.post(url=api_url, json=payload) as response:
                 if response.status == 200:
                     async for data in response.content.iter_any():
-                        if ttft == 0:
-                            ttft = time.perf_counter() - st
-                            output.ttft = ttft
+                        
+                        # print("generated_text : \n" , generated_text, generated_text[0] == payload["prompt"], len(generated_text[0]))
+                        if ttft == 0 :
+                            body = data.decode("utf-8").strip("\0")
+                            generated_text = json.loads(body)["text"]
+                            # for chunked prefill
+                            if len(generated_text[0]) != len(payload["prompt"]):
+                        # if ttft == 0:
+                                ttft = time.perf_counter() - st
+                                output.ttft = ttft
                     output.latency = time.perf_counter() - st
 
                     # When streaming, '\0' is appended to the end of response.
