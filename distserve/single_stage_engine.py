@@ -29,7 +29,7 @@ from distserve.utils import Counter, cudaMemoryIpcHandle, Stage
 from distserve.lifetime import LifetimeEvent, LifetimeEventType
 from distserve.tokenizer import get_tokenizer
 from distserve.block_manager import BlockManager
-from distserve.worker import ParaWorker, ENABLE_DYNAMIC_SWITCH
+from distserve.worker import ParaWorker, ENABLE_DYNAMIC_SWITCH, ENABLE_MPS
 from distserve.context_stage_scheduler import ContextStageSchedConfig, ContextStageScheduler, get_context_stage_scheduler
 from distserve.decoding_stage_scheduler import DecodingStageSchedConfig, DecodingStageScheduler, get_decoding_stage_scheduler
 
@@ -534,9 +534,21 @@ class SingleStageLLMEngine(ABC):
             workers_num_per_device =  5 if ENABLE_DYNAMIC_SWITCH else 2
             prefill_workers_num_per_device =  3 if ENABLE_DYNAMIC_SWITCH else 1
             decode_workers_num_per_device =  2 if ENABLE_DYNAMIC_SWITCH else 1
-
+            
             initialized_workers_map = {}
             task_list = []
+            nsight_runtime_env={"env_vars": {"ENABLE_MPS": str(ENABLE_MPS), 
+                                      "ENABLE_DYNAMIC_SWITCH": str(ENABLE_DYNAMIC_SWITCH)},
+                                "nsight": {
+                                        "cuda-graph-trace": "node",
+                                        "t": "cuda,cudnn,cublas,nvtx",
+                                        "o": "'worker_process_%p'",
+                                        # "cudabacktrace": "all",
+                                        # "stop-on-exit": "true",
+                                    }
+                }
+            default_runtime_env = {"env_vars": {"ENABLE_MPS": str(ENABLE_MPS), 
+                                      "ENABLE_DYNAMIC_SWITCH": str(ENABLE_DYNAMIC_SWITCH)}}
             for j in range(prefill_instance.parallel_config.tensor_parallel_size):
                 async def _create_worker():
                     tmp_parallel_config = copy.deepcopy(prefill_instance.parallel_config)
@@ -544,12 +556,14 @@ class SingleStageLLMEngine(ABC):
                     tmp_parallel_config.tensor_parallel_rank = j
                     # 2 prefill worker and 2 decode worker in one device
                     # this aims for dynamic cast mps SM partition percentage
-                    for _ in range(workers_num_per_device):
+                    for n in range(workers_num_per_device):
                         worker = ParaWorker.options(
                                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                                     placement_group=cur_placement_group,
                                     placement_group_capture_child_tasks=True,
-                                )
+                                ),
+                                # runtime_env=nsight_runtime_env if n == 0 else default_runtime_env
+                                runtime_env=default_runtime_env
                             ).remote()
                         gpu_id = ray.get(worker.get_device_id.remote())
                         item = initialized_workers_map.get(gpu_id, [])
@@ -681,10 +695,11 @@ class SingleStageLLMEngine(ABC):
         )
             
         logger.info(f"Profiling result: num_gpu_blocks: {num_gpu_blocks}, num_cpu_blocks: {num_cpu_blocks}")
-        if self.stage == Stage.CONTEXT:
-            # Do not set to 0 to avoid division by 0
-            logger.info(f"The engine performs context stage, setting num_cpu_blocks to 1")
-            num_cpu_blocks = 1
+        # if self.stage == Stage.CONTEXT:
+        #     # Do not set to 0 to avoid division by 0
+        #     logger.info(f"The engine performs context stage, setting num_cpu_blocks to 1")
+        #     num_cpu_blocks = 1
+        num_cpu_blocks = 1024
         logger.info("Allocating kv cache")
         kv_cache_mem_handles_1d = await asyncio.gather(*self._remote_call_all_workers_async(
             "init_kvcache_and_swap", num_gpu_blocks, num_cpu_blocks, bypass_block_init

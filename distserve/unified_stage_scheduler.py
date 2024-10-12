@@ -26,10 +26,14 @@ def _check_add_to_cur_batch(self, next_batch, request: Request, is_context, trig
             ]) + self._get_block_needed(request.get_input_len() + request.get_output_len()) \
                 <= self.block_manager.max_num_gpu_blocks
         )
-        can_add =  all([cond_0, cond_1, cond_2])
+        # history_blocks = len(self.block_manager.block_table[request.request_id])  if request.request_id in self.block_manager.block_table else 0
+        # print(f"request-{request.request_id} need: {self.block_manager.get_num_blocks_needed(request)}, actual: {self.block_manager.get_num_avail_gpu_blocks()}" )
+        cond_3 = self.block_manager.get_num_blocks_needed(request) < self.block_manager.get_num_avail_gpu_blocks()
+        can_add =  all([cond_0, cond_1, cond_2, cond_3])
         if can_add:
             if trigger_swap:
                 logger.info("Swap-in triggered")
+                # print(f"request-{request.request_id} need: {self.block_manager.get_num_blocks_needed(request)}, actual: {self.block_manager.get_num_avail_gpu_blocks()}" )
                 self.block_manager.swap_in_requests([request])
                 self.batch_queues[self.cur_index].add_request(request)
                 self.block_manager.allocate_blocks(self.batch_queues[self.cur_index].requests[-1])
@@ -62,7 +66,8 @@ def _check_add_to_cur_batch(self, next_batch, request: Request, is_context, trig
                 sum([
                     self._get_block_needed(len(req.prompt_token_ids))
                     for req in next_batch.requests + [request]
-                ])<= avail_blocks and avail_blocks > self.block_manager.max_num_gpu_blocks * 0.05
+                ])<= avail_blocks 
+                # and avail_blocks > self.block_manager.max_num_gpu_blocks * 0.05
             )
     
         can_add =  all([cond_0, cond_1, cond_2])
@@ -99,16 +104,23 @@ def check_and_alloc_current_runing(self):
 
     # Check whether the blocks on GPU is enough for the next batch.
     # If not, swap out the last request
+    # while sum([
+    #     sum([
+    #         self._get_block_needed(req.get_input_len() + req.get_output_len())
+    #         for req in self.batch_queues[index].requests
+    #     ])
+    #     for index in range(self.parallel_config.pipeline_parallel_size)
+    # ]) + sum([
+    #     self._get_block_needed(req.get_input_len())
+    #     for req in self.waiting_queue
+    # ]) > self.block_manager.max_num_gpu_blocks:
     while sum([
         sum([
-            self._get_block_needed(req.get_input_len() + req.get_output_len())
+            self.block_manager.get_num_blocks_needed(req) - len(self.block_manager.block_table[req.request_id]) 
             for req in self.batch_queues[index].requests
         ])
         for index in range(self.parallel_config.pipeline_parallel_size)
-    ]) + sum([
-        self._get_block_needed(req.get_input_len())
-        for req in self.waiting_queue
-    ]) > self.block_manager.max_num_gpu_blocks:
+    ]) > self.block_manager.get_num_avail_gpu_blocks():
         logger.info("No enough GPU blocks. Swap-out triggered")
         request = self.batch_queues[self.cur_index].requests.pop(-1)
         self.swapped_queue.append(request)
