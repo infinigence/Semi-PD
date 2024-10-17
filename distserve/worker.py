@@ -104,7 +104,7 @@ class ParaWorker:
         #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(DECODE_ENGINE_SM_PERCENTILE))
         # os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(50))
         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(thread_percentile))
-        os.putenv("CUDA_LAUNCH_BLOCKING","1")
+        # os.putenv("CUDA_LAUNCH_BLOCKING","1")
 
 
         # os.environ["NCCL_DEBUG"] = "INFO"      
