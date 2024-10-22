@@ -30,6 +30,8 @@ from glob import glob
 from torch import nn
 from typing import Callable, Dict, Optional, Tuple
 
+
+
 #######################
 #    Preprocessors    #
 #######################
@@ -403,6 +405,28 @@ def divideWeightAndSave(
 ###################
 #    Interface    #
 ###################
+_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from safetensors.torch import load_file, safe_open, save_file
+import torch
+
+def safetensors_weights_iterator(
+    hf_weights_files: List[str]
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files."""
+    # enable_tqdm = not torch.distributed.is_initialized(
+    # ) or torch.distributed.get_rank() == 0
+    # for st_file in tqdm(
+    #         hf_weights_files,
+    #         desc="Loading safetensors checkpoint shards",
+    #         # disable=not enable_tqdm,
+    #         bar_format=_BAR_FORMAT,
+    # ):
+    for st_file in hf_weights_files:
+        with safe_open(st_file, framework="pt") as f:
+            for name in f.keys():  # noqa: SIM118
+                param = f.get_tensor(name)
+                yield name, param
 
 def convert_weights(
     input: str, 
@@ -418,16 +442,25 @@ def convert_weights(
     # If the whole model is saved in a single file, then load the state dict directly
     # otherwise, load them separately and merge them into a single state dict
     input_files = glob(input)
+    print(input_files)
+    files = os.listdir(input)
+    print(files)
+    files = [os.path.join(input,i) for i in files if str(i).endswith(".safetensors")]
+    print(files)
+    
     if len(input_files) == 0:
         ValueError(f"Input {input} does not match any files")
         print(f"Input {input} does not match any files")
         exit(1)
     
+    
+    weight_iterator = safetensors_weights_iterator(files)
     # Load file(s)
     state_dict = {}
-    for file in input_files:
-        print(f"Loading {file}")
-        state_dict.update(torch.load(file, torch.device("cpu")))
+    # for file in input_files:
+    for name, weight in weight_iterator:
+        print(f"Loading {name}")
+        state_dict.update({name:weight})
 
     # Change dtype
     for key in state_dict:
