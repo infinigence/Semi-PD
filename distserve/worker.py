@@ -84,6 +84,17 @@ class ParaWorker:
         #         os.putenv('CUDA_MPS_ACTIVE_THREAD_PERCENTAGE', str(DECODE_ENGINE_SM_PERCENTILE))
         pass
     
+    def compute_sin_cos_cache(self):
+        head_dim = self.model_config.get_head_size()
+        rope_theta = self.model_config._get_hf_config().rope_theta
+        max_model_len = self.model_config.get_max_model_len()
+        inv_freq = 1.0 / (rope_theta**(torch.arange(0, head_dim, 2, dtype=torch.float) / head_dim))
+        t = torch.arange(max_model_len, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        self.cos_sin_cache_cpu  = torch.cat([cos.reshape(cos.shape[0], -1, 2),sin.reshape(sin.shape[0], -1, 2)],dim=-1).reshape(max_model_len,-1)
+    
     def init(self,
         worker_id: int,
         stage: Stage,
@@ -207,6 +218,10 @@ class ParaWorker:
         )
         if not bypass_weigit_init:
             self.lazy_init_weight(enable_ipc_mem=True, is_alloc=True)
+            torch_tensor = self.model.get_cos_sin_cache()
+            self.compute_sin_cos_cache()
+            torch_tensor.copy_(self.cos_sin_cache_cpu.flatten())
+            
         # breakpoint()
         self.model.init_communicator(self.tensor_parallel_id, self.pipeline_parallel_id)
         # self.model.init_p2p_communicator(self.peer_ids)
@@ -221,7 +236,12 @@ class ParaWorker:
         if not bypass_weigit_init:
             logger.info("init weight")
             # breakpoint()
-            self.model.init_dummy_weights()
+            if self.model_config.use_dummy_weights:
+                self.model.init_dummy_weights()
+            else:
+                path = download_and_convert_weights(self.model_config)
+                print("model path : ", path)
+                self.model.load_weight(path)
         # else:
         #     if not lazy_init:
         #         self.model.init_dummy_weights_fsdp()

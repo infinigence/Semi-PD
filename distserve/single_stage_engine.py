@@ -698,8 +698,9 @@ class SingleStageLLMEngine(ABC):
         # if self.stage == Stage.CONTEXT:
         #     # Do not set to 0 to avoid division by 0
         #     logger.info(f"The engine performs context stage, setting num_cpu_blocks to 1")
-        #     num_cpu_blocks = 1
-        num_cpu_blocks = 1024
+        # num_cpu_blocks = 1
+        # num_cpu_blocks = 1024
+        num_cpu_blocks = 4096
         logger.info("Allocating kv cache")
         kv_cache_mem_handles_1d = await asyncio.gather(*self._remote_call_all_workers_async(
             "init_kvcache_and_swap", num_gpu_blocks, num_cpu_blocks, bypass_block_init
