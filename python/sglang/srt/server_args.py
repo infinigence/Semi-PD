@@ -287,6 +287,12 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
+            if self.enable_semi_pd and not self.disable_custom_all_reduce:
+                logger.warning(
+                    "Semi-PD is enabled. Disable custom all reduce to prevent hanging."
+                )
+                self.disable_custom_all_reduce = True
+
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
             # NEXTN shares the same implementation of EAGLE

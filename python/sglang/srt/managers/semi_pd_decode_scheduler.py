@@ -361,7 +361,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
         logger.debug(f"Process batch result prefill: {[r.rid for r in batch.reqs]}")
 
         batch.output_ids = torch.tensor(
-            result.next_token_ids, dtype=torch.int32, device=self.device
+            result.next_token_ids, dtype=torch.int64, device=self.device
         )
         self.process_batch_result_prefill(batch, result)
 
