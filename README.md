@@ -11,6 +11,7 @@ This repository originally started as a fork of the SGLang project. Semi-PD is a
 ```shell
 # setup the distserve conda environment
 conda env create -f semi_pd -y python=3.11
+conda activate semi_pd
 
 # build IPC dependency
 cd Semi-PD/semi-pd-ipc/
