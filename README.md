@@ -38,7 +38,7 @@ echo quit | sudo nvidia-cuda-mps-control
 ```
 
 ### Run online serving
-Semi-PD can be enabled using the --enable-semi-pd flag. Additionally, our implementation does not share activations between the prefill and decode phases, which may result in slightly higher memory usage compared to the original SGLang. If an out-of-memory issue occurs, consider reducing the value of --mem-fraction-static to mitigate memory pressure.
+Semi-PD can be enabled using the `--enable-semi-pd` flag. Additionally, our implementation does not share activations between the prefill and decode phases, which may result in slightly higher memory usage compared to the original SGLang. If an out-of-memory issue occurs, consider reducing the value of `--mem-fraction-static` to mitigate memory pressure.
 
 ```shell
 
