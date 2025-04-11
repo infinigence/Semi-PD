@@ -345,7 +345,7 @@ class ModelRunner:
 
     def get_ipc_info(self) -> IPCInfo:
         def check_duplicate_handle(handle_to_name_, handle_, name_):
-            if handle_to_name_.get(tuple(handle_), None) is not None:
+            if handle_to_name_.get(tuple(handle_), None) is not None and handle_ != "BYPASS":
                 logger.warning(
                     f"Duplicate handle found, {handle_to_name_[tuple(handle_)]} and {name_}"
                 )
@@ -374,7 +374,12 @@ class ModelRunner:
             # Create a parameter that shares storage with source parameter
             source_param = source_params[name]
             param_tensor = source_param.view_as(source_param)
-            ipc_handle = get_ipc_handle(param_tensor)
+            
+            # Bypass empty parameter
+            if param_tensor.numel() == 0:
+                ipc_handle = "BYPASS"
+            else:
+                ipc_handle = get_ipc_handle(param_tensor)
             check_duplicate_handle(handle_to_name, ipc_handle, name)
 
             weight_handles[name] = ipc_handle
@@ -404,7 +409,12 @@ class ModelRunner:
                 tensor_info[name] = (None, None, None)
                 continue
             buffer_tensor = source_buffer.view_as(source_buffer)
-            ipc_handle = get_ipc_handle(buffer_tensor)
+            
+            # Bypass empty parameter
+            if buffer_tensor.numel() == 0:
+                ipc_handle = "BYPASS"
+            else:
+                ipc_handle = get_ipc_handle(buffer_tensor)
             check_duplicate_handle(handle_to_name, ipc_handle, name)
 
             register_buffer_handles[name] = ipc_handle
@@ -491,10 +501,17 @@ class ModelRunner:
             assert (
                 share_param_handle is not None
             ), f"Parameter {name} not found in meta_info"
-
-            share_param_tensor = convert_ipc_handle_to_tensor(
-                share_param_handle, size, dtype, device
-            ).view(shape)
+            
+            try:
+                if shape == torch.Size([0]):
+                    share_param_tensor = torch.empty(0, dtype=dtype, device=device)
+                else:
+                    share_param_tensor = convert_ipc_handle_to_tensor(
+                        share_param_handle, size, dtype, device
+                    ).view(shape)
+            except Exception as e:
+                raise NotImplementedError(f"Parameter {name, size, dtype, device} is not supported in Semi-PD")
+            
             new_param = nn.Parameter(share_param_tensor, requires_grad=False)
             setattr(module, param_name, new_param)
 
