@@ -13,9 +13,7 @@ This repository originally started as a fork of the SGLang project. Semi-PD is a
 conda env create -f semi_pd -y python=3.11
 
 # clone and build alioth
-git clone git@gitlab.infini-ai.com:compute/aliothllm.git
-git submodule update --init --recursive
-cd aliothllm && python setup.py bdist_wheel
+git@github.com:infinigence/Semi-PD.git
 
 # build IPC dependency
 cd Semi-PD/semi-pd-ipc/
