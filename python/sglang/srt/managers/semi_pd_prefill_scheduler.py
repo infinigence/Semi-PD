@@ -73,6 +73,9 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
 
     def to_extend_batch(self, resp: GetNextPrefillBatchOutput):
         can_run_list = [r for r in self.waiting_queue if r.rid in resp.rids]
+        # Sort by the order of resp.rids
+        can_run_list.sort(key=lambda r: resp.rids.index(r.rid))
+
         if self.chunked_rid != resp.chunked_rid:
             # Last chunked req has finished prefilling, remove it from waiting queue
             new_waiting_queue = []
@@ -92,6 +95,7 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             ]
 
         for i, r in enumerate(can_run_list):
+            assert r.rid == resp.rids[i]
             r.extend_input_len = resp.extend_input_lens[i]
             req_pool_idx = resp.req_pool_indices[i]
             pre_len = resp.prefix_lens[i]
@@ -129,9 +133,9 @@ class SemiPDPrefillScheduler(SemiPDScheduler):
             self.send_to_d_instance.send_pyobj(req)
             resp = self.bridge_socket.recv_pyobj()
             logger.debug(f"Recv response from D worker: {resp}")
-            assert isinstance(resp, GetNextPrefillBatchOutput), (
-                f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
-            )
+            assert isinstance(
+                resp, GetNextPrefillBatchOutput
+            ), f"Expected GetNextPrefillBatchOutput, but got {type(resp)}"
 
         if self.attn_tp_size > 1:
             attn_tp_rank_0 = self.dp_rank * self.attn_tp_size

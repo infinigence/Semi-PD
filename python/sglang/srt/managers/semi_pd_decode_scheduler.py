@@ -19,8 +19,9 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-import zmq
 import torch.distributed as dist
+import zmq
+
 from sglang.semi_pd.utils import InstanceRole
 from sglang.srt.managers.io_struct import (
     BatchProcessPrefillResultReq,
@@ -118,8 +119,8 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                 req: Req
                 message = TokenizedGenerateReqInput(
                     rid=req.rid,
-                    input_text=req.origin_input_text,
-                    input_ids=req.origin_input_ids,
+                    input_text=req.origin_input_text + req.decoded_text,
+                    input_ids=req.origin_input_ids + req.output_ids,
                     image_inputs=req.image_inputs,
                     sampling_params=req.sampling_params,
                     return_logprob=req.return_logprob,
@@ -134,7 +135,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
                     is_retracted=True,
                 )
 
-                self.handle_generate_request(message)
+                self.waiting_queue.insert(0, req)
                 self.send_to_p_instance.send_pyobj(message)
         else:
             self.new_token_ratio = max(
