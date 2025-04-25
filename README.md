@@ -49,3 +49,6 @@ python3 -m sglang.launch_server \
   --enable-semi-pd  --mem-fraction-static 0.85
 ```
 
+## Evaluation
+
+![Semi-PD](./Semi-PD/docs/_static/image/evaluation_semi_pd.png)
