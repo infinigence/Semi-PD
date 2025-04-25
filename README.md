@@ -51,4 +51,4 @@ python3 -m sglang.launch_server \
 
 ## Evaluation
 
-![Semi-PD](./Semi-PD/docs/_static/image/evaluation_semi_pd.png)
+![Semi-PD](./docs/_static/image/evaluation_semi_pd.png)
