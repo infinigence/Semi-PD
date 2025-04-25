@@ -9,17 +9,31 @@ This repository originally started as a fork of the SGLang project. Semi-PD is a
 
 ## Build && Install
 ```shell
-# setup the distserve conda environment
+# setup the semi-pd conda environment
 conda env create -f semi_pd -y python=3.11
 conda activate semi_pd
 
-# build IPC dependency
-cd Semi-PD/semi-pd-ipc/
-pip install -e .
+# Use the last release branch
+git clone git@github.com:infinigence/Semi-PD.git
+cd Semi-PD
+pip install --upgrade pip
 
+# build IPC dependency
+cd ./semi-pd-ipc/
+pip install -e .
+```
+### For NVIDIA GPUs
+```shell
 # build Semi-PD
 cd ..
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+```
+### For AMD GPUs
+```shell
+cd ../sgl-kernel
+python setup_rocm.py install
+cd ..
+pip install -e "python[all_hip]"
 ```
 
 ## Launching
