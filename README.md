@@ -37,18 +37,27 @@ pip install -e "python[all_hip]"
 ```
 
 ## Using docker to build base environment
+You can follow the following steps to build the base environment, or build from [Dockerfile](https://github.com/infinigence/Semi-PD/tree/update_readme/docker).
 
 ### Pull the NVIDIA image
 ```shell
 docker pull lmsysorg/sglang:v0.4.4.post1-cu124
+
+docker run -it --gpus all -p 30000:30000 -v /your/path:/your/path --ipc=host --name semi_pd v0.4.4.post1-cu124:latest
+
+docker exec -it semi_pd bash
 ```
 
 ### Pull the AMD image
 ```shell
 docker pull lmsysorg/sglang:v0.4.4.post1-rocm630
+
+docker run -it --device=/dev/kfd --device=/dev/dri --shm-size=32g -p 30000:30000 -v /your/path:/your/path --ipc=host --name semi_pd v0.4.4.post1-rocm630:latest
+
+docker exec -it semi_pd bash
 ```
 
-Then you can create a container from the image and follow the Build && Install section to build Semi-PD, or you can build from [Dockerfile](https://github.com/infinigence/Semi-PD/tree/update_readme/docker).
+Then you can follow the `Build && Install` section to build Semi-PD.
 
 
 
