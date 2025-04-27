@@ -369,7 +369,6 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = json.loads(chunk)
-
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
@@ -492,6 +491,12 @@ def get_dataset(args, tokenizer):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
+        )
+    elif args.dataset_name == "math_500":
+        input_requests = sample_math_500_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
         )
     elif args.dataset_name == "generated-shared-prefix":
         input_requests = sample_generated_shared_prefix_requests(
@@ -667,11 +672,31 @@ def sample_sharegpt_requests(
             continue
 
         filtered_dataset.append((prompt, prompt_len, output_len))
+    
+    # # sort and select medium length requests
+    # filtered_dataset = sorted(filtered_dataset, key=lambda x: x[1], reverse=True)
+    # filtered_dataset = [filtered_dataset[len(filtered_dataset) // 2]]
 
     print(f"#Input tokens: {np.sum([x[1] for x in filtered_dataset])}")
     print(f"#Output tokens: {np.sum([x[2] for x in filtered_dataset])}")
     return filtered_dataset
 
+
+def sample_math_500_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[Tuple[str, int, int, None]]:
+    filtered_dataset: List[Tuple[str, int, int]] = []
+    with open(dataset_path, encoding='utf-8') as f:
+        for line in f.readlines():
+            data = json.loads(line)
+            problem = tokenizer.encode(data["problem"])
+            solution = tokenizer(data["solution"]).input_ids
+            filtered_dataset.append((data["problem"], len(problem), len(solution)))
+    sampled_requests = filtered_dataset[0:num_requests]
+
+    return sampled_requests
 
 def sample_random_requests(
     input_len: int,
@@ -693,7 +718,7 @@ def sample_random_requests(
         size=num_prompts,
     )
 
-    if True:
+    if False:
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
@@ -967,6 +992,8 @@ async def benchmark(
     extra_request_body: Dict[str, Any],
     profile: bool,
     pd_seperated: bool = False,
+    benchmark_name: str = "",
+    iter: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1005,8 +1032,8 @@ async def benchmark(
         print("Initial test run completed. Starting main benchmark run...")
 
     # Flush cache
-    if "sglang" in backend:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+    # if "sglang" in backend:
+    #     requests.post(base_url + "/flush_cache")
 
     time.sleep(1.0)
 
@@ -1020,6 +1047,14 @@ async def benchmark(
             print("Profiler started")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
+    print(f"request_rate: {request_rate} max_concurrency: {max_concurrency}")
+    
+    result_dir = f"{benchmark_name}_{request_rate}"
+    if not os.path.exists(result_dir):
+        os.makedirs(result_dir)
+    
+    assert os.path.exists(result_dir), f"Directory {result_dir} does not exist"
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
@@ -1041,6 +1076,26 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    
+    ttft_benchmark_name = f"{result_dir}/ttft_{iter}.npy"
+    itl_benchmark_name = f"{result_dir}/itl_{iter}.npy"
+    
+    # process outputs
+    ttft_list : List[float] = []
+    itl_list : List[List[float]]= []
+    for req_out in outputs:
+        ttft_list.append(req_out.ttft)
+        itl_list.append(req_out.itl)
+    
+    ttft_list = np.array(ttft_list)
+    
+    max_length = max(len(sublist) for sublist in itl_list)
+    padded_itl_list = [sublist + [-1] * (max_length - len(sublist)) for sublist in itl_list]
+    itl_list = np.array(padded_itl_list)
+    
+    
+    np.save(ttft_benchmark_name, ttft_list)
+    np.save(itl_benchmark_name, itl_list)
 
     # Stop profiler
     if profile:
@@ -1052,16 +1107,19 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
-        if pd_seperated:
-            accept_length = server_info.json()["decode"][0].get(
-                "avg_spec_accept_length", None
-            )
-        else:
-            accept_length = server_info.json().get("avg_spec_accept_length", None)
-    else:
-        accept_length = None
+    # if "sglang" in backend:
+    #     server_info = requests.get(base_url + "/get_server_info")
+    #     if pd_seperated:
+    #         accept_length = server_info.json()["decode"][0].get(
+    #             "avg_spec_accept_length", None
+    #         )
+    #     else:
+    #         print(server_info)
+    #         accept_length = server_info.json().get("avg_spec_accept_length", None)
+    # else:
+    #     accept_length = None
+    
+    accept_length = None
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -1334,24 +1392,51 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer)
 
-    return asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            max_concurrency=args.max_concurrency,
-            disable_tqdm=args.disable_tqdm,
-            lora_name=args.lora_name,
-            extra_request_body=extra_request_body,
-            profile=args.profile,
-            pd_seperated=args.pd_seperated,
-        )
-    )
+    import os
 
+    if args.dataset_name == "random":
+        input_len = args.random_input_len
+        output_len = args.random_output_len
+        random_range_ratio = args.random_range_ratio
+        path_name = f"random_{input_len}_{output_len}_{random_range_ratio}_{args.max_concurrency}"
+        save_path = os.path.join(args.benchmark_save_path, path_name)
+    elif args.dataset_name == "sharegpt":
+        path_name = f"sharegpt_{args.num_prompts}"
+        save_path = os.path.join(args.benchmark_save_path, path_name)
+    elif args.dataset_name == "math_500":
+        path_name = f"math_500"
+        save_path = os.path.join(args.benchmark_save_path, path_name)
+    else:
+        raise ValueError(f"Dataset name {args.dataset_name} not supported") 
+    
+    
+    request_rate = args.request_rate
+    request_rate_extent = args.request_rate_extent
+    for j in range(0,request_rate_extent):
+        args.request_rate = request_rate + j * 1
+        # measure several times to take average, hardcode to 1 for now
+        for i in range(1):
+            asyncio.run(
+                benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                max_concurrency=args.max_concurrency,
+                disable_tqdm=args.disable_tqdm,
+                lora_name=args.lora_name,
+                extra_request_body=extra_request_body,
+                profile=args.profile,
+                pd_seperated=args.pd_seperated,
+                benchmark_name=save_path,
+                iter=i,
+            )
+        )
+    
+    return None
 
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
@@ -1391,7 +1476,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "generated-shared-prefix"],
+        choices=["sharegpt", "random", "generated-shared-prefix", "math_500"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1553,5 +1638,19 @@ if __name__ == "__main__":
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
     )
+    group.add_argument(
+        "--benchmark-save-path",
+        type=str,
+        default="",
+        required=True,
+        help="Path to save the benchmark results.",
+    )
+    group.add_argument(
+        "--request-rate-extent",
+        type=int,
+        default=10,
+        help="Number of request rate to benchmark",
+    )
+    
     args = parser.parse_args()
     run_benchmark(args)

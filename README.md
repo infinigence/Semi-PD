@@ -95,3 +95,7 @@ python3 -m sglang.launch_server \
 ## Evaluation
 
 ![Semi-PD](./docs/_static/image/evaluation_semi_pd.png)
+
+### To reproduce the evaluation results
+
+Please refer to the [evaluation](./evaluation/README.md) directory.
