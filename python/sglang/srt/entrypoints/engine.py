@@ -579,13 +579,11 @@ def _launch_semi_pd_subprocesses(
 
         tp_rank_base = tp_size_per_node * server_args.node_rank
 
-        # server_args.max_total_tokens = 100000
 
         # Init P & D schedulers.
         for tp_rank in tp_rank_range:
             queue_idx = tp_rank % tp_size_per_node
             p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            # d_ipc_info_queue = d_ipc_info_queues[queue_idx]
             gpu_id = (
                 server_args.base_gpu_id
                 + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
