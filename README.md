@@ -10,7 +10,7 @@ This repository originally started as a fork of the SGLang project. Semi-PD is a
 ## Build && Install
 ```shell
 # setup the semi-pd conda environment
-conda env create -f semi_pd -y python=3.11
+conda create -n semi_pd -y python=3.11
 conda activate semi_pd
 
 # Use the last release branch
