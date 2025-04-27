@@ -89,7 +89,7 @@ Semi-PD can be enabled using the `--enable-semi-pd` flag. Additionally, our impl
 python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --served-model-name $MODEL_NAME \
   --host 0.0.0.0 --port $SERVE_PORT --trust-remote-code  --disable-radix-cache \
-  --enable-semi-pd  --mem-fraction-static 0.85
+  --enable-semi-pd  --mem-fraction-static 0.85 --tp $TP_SIZE
 ```
 
 ## Evaluation
