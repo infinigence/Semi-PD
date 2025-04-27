@@ -65,11 +65,12 @@ DTYPE_TO_ATEN = {
 
 def get_ipc_handle(tensor: torch.Tensor):
     # https://github.com/pytorch/pytorch/blob/cbcc03c2ad11fbf1080f6a1025cc3f7aee0c858d/torch/multiprocessing/reductions.py#L371
-    (device, handle, storage_size_bytes# size(in bytes) of the storage
-     , storage_offset_bytes# offset(in bytes) of the storage in the CUDA allocation
-     ) = (
-        tensor.storage()._share_cuda_()[:4]
-    )
+    (
+        device,
+        handle,
+        storage_size_bytes,  # size(in bytes) of the storage
+        storage_offset_bytes,  # offset(in bytes) of the storage in the CUDA allocation
+    ) = tensor.storage()._share_cuda_()[:4]
     assert storage_size_bytes == tensor.numel() * tensor.element_size()
 
     return semi_pd_ipc.get_ipc_handle(tensor), storage_offset_bytes

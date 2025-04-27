@@ -329,7 +329,6 @@ class DataParallelController:
         # Launch tensor parallel scheduler processes
         p_scheduler_pipe_readers = []
         d_scheduler_pipe_readers = []
-        standalone_scheduler_pipe_readers = []
         tp_size_per_node = server_args.tp_size // server_args.nnodes
         tp_rank_range = range(
             tp_size_per_node * server_args.node_rank,
@@ -338,63 +337,12 @@ class DataParallelController:
         p_ipc_info_queues: List[mp.Queue] = [
             mp.Queue() for _ in range(tp_size_per_node)
         ]
-        d_ipc_info_queues: List[mp.Queue] = [
-            mp.Queue() for _ in range(tp_size_per_node)
-        ]
-
-        for tp_rank in tp_rank_range:
-            rank_port_args = port_args
-            if server_args.enable_dp_attention:
-                rank_port_args, dp_rank = self.get_semi_pd_dp_attention_world_info(
-                    server_args, port_args, tp_rank, dp_rank
-                )
-
-            reader_standalone, writer_standalone = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            d_ipc_info_queue = d_ipc_info_queues[queue_idx]
-            proc = mp.Process(
-                target=run_standalone_scheduler_process,
-                args=(
-                    server_args,
-                    rank_port_args,
-                    gpu_id,
-                    tp_rank,
-                    dp_rank,
-                    writer_standalone,
-                    False,
-                    p_ipc_info_queue,
-                    d_ipc_info_queue,
-                ),
-            )
-            proc.start()
-            self.scheduler_procs.append(proc)
-            standalone_scheduler_pipe_readers.append(reader_standalone)
 
         # Wait for model to finish loading
         scheduler_info = []
         tp_rank_base = tp_size_per_node * server_args.node_rank
-        max_total_num_tokens = None
-        for i, reader in enumerate(standalone_scheduler_pipe_readers):
-            logger.info(
-                f"Waiting for standalone scheduler {tp_rank_base + i} to be ready"
-            )
-            data = reader.recv()
-            assert data["status"] == "ready"
-            # Get max_total_num_tokens from standalone schedulers
-            if i > 0:
-                assert data["max_total_num_tokens"] == max_total_num_tokens
-            max_total_num_tokens = data["max_total_num_tokens"]
 
-        # P & D schedulers use the same max_total_num_tokens from the standalone scheduler.
-        assert max_total_num_tokens is not None
-        server_args.max_total_tokens = max_total_num_tokens
-
+        first = True
         # Init P & D schedulers.
         for tp_rank in tp_rank_range:
             rank_port_args = port_args
@@ -410,7 +358,6 @@ class DataParallelController:
             )
             queue_idx = tp_rank % tp_size_per_node
             p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            d_ipc_info_queue = d_ipc_info_queues[queue_idx]
 
             os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
                 DECODE_ENGINE_SM_PERCENTILE
@@ -428,14 +375,21 @@ class DataParallelController:
                     tp_rank,
                     dp_rank,
                     writer_decode,
-                    d_ipc_info_queue,
-                    True,
+                    p_ipc_info_queue,
+                    False,
                     InstanceRole.DECODE,
                 ),
             )
             proc.start()
             self.scheduler_procs.append(proc)
             d_scheduler_pipe_readers.append(reader_decode)
+            if first:
+                data = reader_decode.recv()
+                server_args.max_total_tokens = data["max_total_num_tokens"]
+                first = False
+                logger.info(f"Waiting for D instance {tp_rank_base} to be ready")
+                assert data["status"] == "ready"
+                scheduler_info.append(data)
 
             os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
                 PREFILL_ENGINE_SM_PERCENTILE
@@ -470,6 +424,8 @@ class DataParallelController:
             scheduler_info.append(data)
 
         for i, reader in enumerate(d_scheduler_pipe_readers):
+            if i == 0:
+                continue
             logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
             data = reader.recv()
             assert data["status"] == "ready"
@@ -477,7 +433,7 @@ class DataParallelController:
 
         logger.info("All schedulers are ready")
 
-        self.max_total_num_tokens = max_total_num_tokens
+        self.max_total_num_tokens = server_args.max_total_tokens
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def round_robin_scheduler(self, req):

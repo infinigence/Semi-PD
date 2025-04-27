@@ -969,7 +969,7 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        if self.instance_role == InstanceRole.OTHER:
+        if self.instance_role == InstanceRole.OTHER or self.instance_role == InstanceRole.DECODE:
             self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
         else:
             assert (
