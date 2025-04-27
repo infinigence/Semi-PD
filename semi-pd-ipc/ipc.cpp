@@ -64,8 +64,10 @@ std::vector<int64_t> GetIPCMemHandle(torch::Tensor tensor) {
 }
 
 // Convert a CUDA IPC memory handle to a CUDA tensor
-torch::Tensor ConvertIPCMemHandleToTensor(std::vector<int64_t> handle_vec, int64_t tensor_size, std::string dtype_str, torch::Device device) {
+torch::Tensor ConvertIPCMemHandleToTensor(std::tuple<std::vector<int64_t>, uint64_t> handle_vec_offset, int64_t tensor_size, std::string dtype_str, torch::Device device) {
     // Convert the handles to cudaIpcMemHandle_t
+    auto const& [handle_vec, offsets] = handle_vec_offset;
+
 	const cudaIpcMemHandle_t handle = bytes2CudaIpcMemHandle(handle_vec);
     // Open the memory handle
 	void* ipc_addr;
@@ -76,7 +78,8 @@ torch::Tensor ConvertIPCMemHandleToTensor(std::vector<int64_t> handle_vec, int64
 		printf("Exiting...");
 		exit(1);
 	}
-	torch::Tensor ipc_tensor = torch::from_blob(ipc_addr, tensor_size,
+    uint8_t* real_ipc_addr = static_cast<uint8_t*>(ipc_addr) + offsets;
+	torch::Tensor ipc_tensor = torch::from_blob(real_ipc_addr, tensor_size,
                           	torch::TensorOptions().dtype(convertStringToDType(dtype_str)).device(device));
     return ipc_tensor;
 }

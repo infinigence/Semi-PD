@@ -59,7 +59,7 @@ class SemiPDDecodeScheduler(SemiPDScheduler):
             gpu_id,
             tp_rank,
             dp_rank,
-            bypass_load_weight,
+            False,
             InstanceRole.DECODE,
         )
 

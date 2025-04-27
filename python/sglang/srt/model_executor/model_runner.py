@@ -345,11 +345,12 @@ class ModelRunner:
 
     def get_ipc_info(self) -> IPCInfo:
         def check_duplicate_handle(handle_to_name_, handle_, name_):
-            if handle_to_name_.get(tuple(handle_), None) is not None and handle_ != "BYPASS":
+            hashed = tuple(handle_[0]), handle_[1]
+            if handle_to_name_.get(hashed, None) is not None and handle_ != "BYPASS":
                 logger.warning(
-                    f"Duplicate handle found, {handle_to_name_[tuple(handle_)]} and {name_}"
+                    f"Duplicate handle found, {handle_to_name_[hashed]} and {name_}"
                 )
-            handle_to_name_[tuple(handle_)] = name_
+            handle_to_name_[hashed] = name_
 
         assert not self.bypass_load_weight
 

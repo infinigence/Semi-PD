@@ -210,6 +210,9 @@ class SemiPDScheduler(Scheduler):
         else:
             # SemiPD
             self.add_to_waiting_queue(req)
+    
+    def get_ipc_info(self):
+        return self.tp_worker.get_ipc_info()
 
 
 class SemiPDStandaloneScheduler:
@@ -381,6 +384,9 @@ def run_scheduler_process(
                 dp_rank,
                 bypass_load_weight,
             )
+
+            ipc_info = scheduler.get_ipc_info()
+            ipc_info_queue.put(ipc_info)
         elif instance_role == InstanceRole.PREFILL:
             from sglang.srt.managers.semi_pd_prefill_scheduler import (
                 SemiPDPrefillScheduler,
@@ -397,7 +403,9 @@ def run_scheduler_process(
         else:
             raise ValueError(f"Invalid instance role: {instance_role}")
 
-        scheduler.share_params_from_ipc(ipc_info)
+        if bypass_load_weight:
+            scheduler.share_params_from_ipc(ipc_info)
+
         scheduler.init_attention_backend()
         if instance_role == InstanceRole.DECODE:
             scheduler.init_cuda_graphs()

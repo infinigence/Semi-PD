@@ -577,63 +577,63 @@ def _launch_semi_pd_subprocesses(
         p_ipc_info_queues: List[mp.Queue] = [
             mp.Queue() for _ in range(tp_size_per_node)
         ]
-        d_ipc_info_queues: List[mp.Queue] = [
-            mp.Queue() for _ in range(tp_size_per_node)
-        ]
+        # d_ipc_info_queues: List[mp.Queue] = [
+        #     mp.Queue() for _ in range(tp_size_per_node)
+        # ]
 
-        for tp_rank in tp_rank_range:
-            queue_idx = tp_rank % tp_size_per_node
-            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            d_ipc_info_queue = d_ipc_info_queues[queue_idx]
+        # for tp_rank in tp_rank_range:
+        #     queue_idx = tp_rank % tp_size_per_node
+        #     p_ipc_info_queue = p_ipc_info_queues[queue_idx]
+        #     d_ipc_info_queue = d_ipc_info_queues[queue_idx]
 
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
+        #     gpu_id = (
+        #         server_args.base_gpu_id
+        #         + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+        #     )
 
-            # Standalone scheduler for weight persistence
-            standalone_reader, standalone_writer = mp.Pipe(duplex=False)
-            standalone_proc = mp.Process(
-                target=run_standalone_scheduler_process,
-                args=(
-                    server_args,
-                    port_args,
-                    gpu_id,
-                    tp_rank,
-                    None,
-                    standalone_writer,
-                    False,
-                    p_ipc_info_queue,
-                    d_ipc_info_queue,
-                ),
-            )
-            with memory_saver_adapter.configure_subprocess():
-                standalone_proc.start()
-            scheduler_procs.append(standalone_proc)
-            standalone_scheduler_pipe_readers.append(standalone_reader)
+        #     # Standalone scheduler for weight persistence
+        #     standalone_reader, standalone_writer = mp.Pipe(duplex=False)
+        #     standalone_proc = mp.Process(
+        #         target=run_standalone_scheduler_process,
+        #         args=(
+        #             server_args,
+        #             port_args,
+        #             gpu_id,
+        #             tp_rank,
+        #             None,
+        #             standalone_writer,
+        #             False,
+        #             p_ipc_info_queue,
+        #             d_ipc_info_queue,
+        #         ),
+        #     )
+        #     with memory_saver_adapter.configure_subprocess():
+        #         standalone_proc.start()
+        #     scheduler_procs.append(standalone_proc)
+        #     standalone_scheduler_pipe_readers.append(standalone_reader)
 
         tp_rank_base = tp_size_per_node * server_args.node_rank
-        max_total_num_tokens = None
-        for i, reader in enumerate(standalone_scheduler_pipe_readers):
-            logger.info(
-                f"Waiting for standalone scheduler {tp_rank_base + i} to be ready"
-            )
-            data = reader.recv()
-            assert data["status"] == "ready"
-            # Get max_total_num_tokens from standalone schedulers
-            if i > 0:
-                assert data["max_total_num_tokens"] == max_total_num_tokens
-            max_total_num_tokens = data["max_total_num_tokens"]
+        # max_total_num_tokens = None
+        # for i, reader in enumerate(standalone_scheduler_pipe_readers):
+        #     logger.info(
+        #         f"Waiting for standalone scheduler {tp_rank_base + i} to be ready"
+        #     )
+        #     data = reader.recv()
+        #     assert data["status"] == "ready"
+        #     # Get max_total_num_tokens from standalone schedulers
+        #     if i > 0:
+        #         assert data["max_total_num_tokens"] == max_total_num_tokens
+        #     max_total_num_tokens = data["max_total_num_tokens"]
 
         # P & D schedulers use the same max_total_num_tokens from the standalone scheduler.
-        assert max_total_num_tokens is not None
-        server_args.max_total_tokens = max_total_num_tokens
+        # assert max_total_num_tokens is not None
+        server_args.max_total_tokens = 100_000
 
         # Init P & D schedulers.
         for tp_rank in tp_rank_range:
             queue_idx = tp_rank % tp_size_per_node
             p_ipc_info_queue = p_ipc_info_queues[queue_idx]
-            d_ipc_info_queue = d_ipc_info_queues[queue_idx]
+            # d_ipc_info_queue = d_ipc_info_queues[queue_idx]
             gpu_id = (
                 server_args.base_gpu_id
                 + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
@@ -654,8 +654,8 @@ def _launch_semi_pd_subprocesses(
                     tp_rank,
                     None,
                     d_writer,
-                    d_ipc_info_queue,
-                    True,
+                    p_ipc_info_queue,
+                    False,
                     InstanceRole.DECODE,
                 ),
             )
