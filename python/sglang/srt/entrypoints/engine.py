@@ -578,8 +578,8 @@ def _launch_semi_pd_subprocesses(
         ]
 
         tp_rank_base = tp_size_per_node * server_args.node_rank
-        # server_args.max_total_tokens = 100_000
-        first = True
+
+        # server_args.max_total_tokens = 100000
 
         # Init P & D schedulers.
         for tp_rank in tp_rank_range:
@@ -615,19 +615,30 @@ def _launch_semi_pd_subprocesses(
                 d_proc.start()
             scheduler_procs.append(d_proc)
             d_scheduler_pipe_readers.append(d_reader)
-            if first:
-                data = d_reader.recv()
-                server_args.max_total_tokens = data["max_total_num_tokens"]
-                first = False
-                logger.info(f"Waiting for D instance {tp_rank_base} to be ready")
-                assert data["status"] == "ready"
-                scheduler_infos.append(data)
 
-        os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-            PREFILL_ENGINE_SM_PERCENTILE
-        )
+        for i, reader in enumerate(d_scheduler_pipe_readers):
+            logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
+            data = reader.recv()
+            assert data["status"] == "ready"
+            scheduler_infos.append(data)
+            server_args.max_total_tokens = data["max_total_num_tokens"]
+            if i > 0:
+                assert (
+                    server_args.max_total_tokens
+                    ==  data["max_total_num_tokens"]
+                )
 
         for tp_rank in tp_rank_range:
+            queue_idx = tp_rank % tp_size_per_node
+            p_ipc_info_queue = p_ipc_info_queues[queue_idx]
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
+                PREFILL_ENGINE_SM_PERCENTILE
+            )
+
+            gpu_id = (
+                server_args.base_gpu_id
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
             logger.info(
                 f"Launch P instance TP {tp_rank} with {os.environ['CUDA_MPS_ACTIVE_THREAD_PERCENTAGE']}% SMs"
             )
@@ -652,13 +663,6 @@ def _launch_semi_pd_subprocesses(
             p_scheduler_pipe_readers.append(p_reader)
 
         assert len(p_scheduler_pipe_readers) == len(d_scheduler_pipe_readers)
-        for i, reader in enumerate(d_scheduler_pipe_readers):
-            if i == 0:
-                continue
-            logger.info(f"Waiting for D instance {tp_rank_base + i} to be ready")
-            data = reader.recv()
-            assert data["status"] == "ready"
-            scheduler_infos.append(data)
 
         for i, reader in enumerate(p_scheduler_pipe_readers):
             logger.info(f"Waiting for P instance {tp_rank_base + i} to be ready")

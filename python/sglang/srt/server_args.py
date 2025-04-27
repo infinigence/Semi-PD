@@ -291,6 +291,7 @@ class ServerArgs:
                 logger.warning(
                     "Semi-PD is enabled. Disable custom all reduce to prevent hanging."
                 )
+                assert self.enable_dp_attention == False, "Semi-PD and DP attention cannot be enabled at the same time yet."
                 self.disable_custom_all_reduce = True
 
         # Speculative Decoding
