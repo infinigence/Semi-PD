@@ -4,13 +4,16 @@
 
 A prefill & decode disaggregated LLM serving framework with shared GPU memory and fine-grained compute isolation.
 
+## Paper
+[Semi-PD: A Prefill & Decode Disaggregated LLM Serving Framework with Shared GPU Memory and Fine-Grained Compute Isolation](./docs/_static/paper/arxiv_semi_PD.pdf)
+
 ## Acknowledgment
 This repository originally started as a fork of the SGLang project. Semi-PD is a research prototype and does not have complete feature parity with open-source SGLang. We have only retained the most critical features and adopted the codebase for faster research iterations.
 
 ## Build && Install
 ```shell
 # setup the semi-pd conda environment
-conda env create -f semi_pd -y python=3.11
+conda create -n semi_pd -y python=3.11
 conda activate semi_pd
 
 # Use the last release branch
@@ -86,9 +89,13 @@ Semi-PD can be enabled using the `--enable-semi-pd` flag. Additionally, our impl
 python3 -m sglang.launch_server \
   --model-path $MODEL_PATH --served-model-name $MODEL_NAME \
   --host 0.0.0.0 --port $SERVE_PORT --trust-remote-code  --disable-radix-cache \
-  --enable-semi-pd  --mem-fraction-static 0.85
+  --enable-semi-pd  --mem-fraction-static 0.85 --tp $TP_SIZE
 ```
 
 ## Evaluation
 
 ![Semi-PD](./docs/_static/image/evaluation_semi_pd.png)
+
+### To reproduce the evaluation results
+
+Please refer to the [evaluation](./evaluation/README.md) directory.
