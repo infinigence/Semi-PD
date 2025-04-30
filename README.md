@@ -7,6 +7,19 @@ A prefill & decode disaggregated LLM serving framework with shared GPU memory an
 ## Paper
 [Semi-PD: A Prefill & Decode Disaggregated LLM Serving Framework with Shared GPU Memory and Fine-Grained Compute Isolation](./docs/_static/paper/arxiv_semi_PD.pdf)
 
+## Citation
+If you use Semi-PD for your research, please cite our [paper](https://arxiv.org/pdf/2504.19867):
+```
+@misc{hong2025semipd,
+      title={semi-PD: Towards Efficient LLM Serving via Phase-Wise Disaggregated Computation and Unified Storage},
+      author={Ke Hong, Lufang Chen, Zhong Wang, Xiuhong Li, Qiuli Mao, Jianping Ma, Chao Xiong, Guanyu Wu, Buhe Han, Guohao Dai, Yun Liang, Yu Wang},
+      year={2025},
+      eprint={2504.19867},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL}
+    }
+```
+
 ## Acknowledgment
 This repository originally started as a fork of the SGLang project. Semi-PD is a research prototype and does not have complete feature parity with open-source SGLang. We have only retained the most critical features and adopted the codebase for faster research iterations.
 
