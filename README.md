@@ -5,9 +5,6 @@
 A prefill & decode disaggregated LLM serving framework with shared GPU memory and fine-grained compute isolation.
 
 ## Paper
-[Semi-PD: A Prefill & Decode Disaggregated LLM Serving Framework with Shared GPU Memory and Fine-Grained Compute Isolation](./docs/_static/paper/arxiv_semi_PD.pdf)
-
-## Citation
 If you use Semi-PD for your research, please cite our [paper](https://arxiv.org/pdf/2504.19867):
 ```
 @misc{hong2025semipd,
