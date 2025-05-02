@@ -1,6 +1,8 @@
 import numpy as np
 import os
 
+import pandas as pd
+
 def show_metrics(path, idx = 0):
     print(f"#########################{path} processed#########################")
     params = path.rsplit("/", 3)[-1]
@@ -91,15 +93,20 @@ if __name__ == "__main__":
         total_metrics[io] = io_metrics
 
     # sorted_io_keys = sorted(total_metrics.keys(), key=lambda x: tuple(map(int, x.split('_'))))
+    # Convert the nested dictionary into a DataFrame
+    data = []
+    for io, rr_dict in total_metrics.items():
+        for rr, metrics in rr_dict.items():
+            row = {"io": io, "rr": rr}  # Add 'io' and 'rr' as columns
+            row.update(metrics)  # Add all metrics
+            data.append(row)
 
-    print_head = True
-    for io in total_metrics.keys():
-        sorted_keys = sorted(total_metrics[io].keys(), key=float)
-        for rr in sorted_keys:
-            metrics = total_metrics[io][rr]
-            if print_head:
-                head = "io\t rr\t" + "\t".join(metrics.keys())
-                print(head)
-                print_head = False
-            csv_line = f"{io}\t {rr}\t " + "\t".join(f"{value:.3f}" for key, value in metrics.items())
-            print(csv_line)
+    df = pd.DataFrame(data)
+
+    # check whether this col all zero
+    if (df["output_throughput"] == 0).all():
+        # remove this col
+        df = df.drop(columns=["output_throughput"])
+
+    # Print the DataFrame in a clean tabular format
+    print(df.to_string(index=False))  # `index=False` removes the default row numbers
