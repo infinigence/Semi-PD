@@ -1,30 +1,15 @@
-# DistServe
+# Semi-PD distserve base
 
-DistServe improves the performance of large language models (LLMs) serving by disaggregating the prefill and decoding
-computation. Existing LLM serving systems colocate the two
-phases and batch the computation of prefill and decoding
-across all users and requests. We find that this strategy not
-only leads to strong prefill-decoding interferences but also
-couples the resource allocation and parallelism plans for both
-phases. In DistServe, you can simply set the parallelism configs and scheduling strategies for the two phases and it will work just like a single instance which handles the KV-Cache communication and memory management automatically. 
-
-It utilizes a high-performance C++ Transformer inference library [SwiftTransformer](https://github.com/LLMServe/SwiftTransformer) as the execution backend, which supports many features like model/pipeline parallelism, FlashAttention, Continuous Batching, and PagedAttention.
-
-It supports:
-- GPT-2 (gpt2, gpt2-xl, ...)
-- OPT (facebook/opt-1.3b, facebook/opt-6.7b, ...)
-- LLaMA2 (meta-llama/Llama-2-7b, meta-llama/Llama-2-13b, ...)
+Semi-PD build from a fork of distserve https://github.com/LLMServe/DistServe.git.
 
 ## Build && Install
 ```shell
-# clone the project
-git clone https://github.com/LLMServe/DistServe.git && cd DistServe
-
 # setup the distserve conda environment
 conda env create -f environment.yml && conda activate distserve
 
-# clone and build the SwiftTransformer library  
-git clone https://github.com/LLMServe/SwiftTransformer.git && cd SwiftTransformer && git submodule update --init --recursive
+# clone and build alioth
+cd SwiftTransformer
+git submodule update --init --recursive
 cmake -B build && cmake --build build -j$(nproc)
 cd ..
 
@@ -34,33 +19,75 @@ pip install -e .
 
 ## Launching
 
+### Introduce
+
+Currently we use ENABLE_MPS env variable to controll the switch between Semi-PD and DistServe.
+
+
+### Enable MPS 
+Only support on NV backend.
+
+```shell
+export CUDA_MPS_ENABLE_PER_CTX_DEVICE_MULTIPROCESSOR_PARTITIONING=1
+nvidia-cuda-mps-control -d
+```
+
+You can disable MPS service by using this cmd:
+```shell
+echo quit | sudo nvidia-cuda-mps-control
+```
+
+
+### Environment veriables
+```shell
+# Common
+RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+
+# Semi-PD
+ENABLE_MPS=1
+CONTEXT_ENGINE_SM_PERCENTILE=100 # context instance sm usage percentile
+DECODE_ENGINE_SM_PERCENTILE=100 # decode instance sm usage percentile
+
+# DistServe
+ENABLE_MPS=0
+
+```
+
 ### Launch Ray Cluster
 
-DistServe relies on [Ray](https://ray.io) to implement distributed workers. If you do not launch a Ray runtime in advance, it will automatically initiate a cluster consisting of all the gpus on the current node. You may need to start the Ray runtime manually in advance if you want to use multiple nodes for inference.
+Semi-PD relies on [Ray](https://ray.io) to implement distributed workers. If you do not launch a Ray runtime in advance, it will automatically initiate a cluster consisting of all the gpus on the current node. You may need to start the Ray runtime manually in advance if you want to use multiple nodes for inference.
 
 ### Run offline example
 
-DistServe requires at least two GPUs to play with. We provide an offline inference example in `examples/offline.py`.
+Semi-PD requires at least 1 GPU to play with. We provide an offline inference example in `examples/offline.py`.
 
-### Run online example
+### Run online serving
 
-To run online inference, you need to launch the DistServe API server, see the comments in `distserve/api_server/distserve_api_server.py`.
+```shell
 
-Then launch the client example in `examples/online.py`.
+ENABLE_MPS=1 CONTEXT_ENGINE_SM_PERCENTILE=100 DECODE_ENGINE_SM_PERCENTILE=100 ENABLE_MPS=1  python -m distserve.api_server.distserve_api_server \
+    --host 0.0.0.0 \
+    --model /path/to/model/ \
+    --tokenizer /path/to/model/  \
+    \
+    --context-tensor-parallel-size 1 \
+    --context-pipeline-parallel-size 1 \
+    --decoding-tensor-parallel-size 1 \
+    --decoding-pipeline-parallel-size 1 \
+    \
+    --block-size 16 \
+    --max-num-blocks-per-req  384 \
+    --gpu-memory-utilization 0.9 \
+    --swap-space 16 \
+    \
+   --context-sched-policy fcfs \
+    --context-max-batch-size 64 \
+    --context-max-tokens-per-batch 4096 \
+    \
+    --decoding-sched-policy fcfs \
+   --port 8000 \
+    --decoding-max-batch-size 1024  --decoding-max-tokens-per-batch 200000 
 
-### Evaluation
-
-To reproduce all the experiments in our paper, please follow the [guidance](./evaluation/README.md).
-
-## Citation
-If you use DistServe for your research, please cite our [paper](https://arxiv.org/abs/2401.09670):
 ```
-@misc{zhong2024distserve,
-      title={DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving}, 
-      author={Yinmin Zhong and Shengyu Liu and Junda Chen and Jianbo Hu and Yibo Zhu and Xuanzhe Liu and Xin Jin and Hao Zhang},
-      year={2024},
-      eprint={2401.09670},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC}
-}
-```
+
+
