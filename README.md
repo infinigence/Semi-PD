@@ -10,6 +10,10 @@ A prefill & decode disaggregated LLM serving framework with shared GPU memory an
 ## Acknowledgment
 This repository originally started as a fork of the SGLang project. Semi-PD is a research prototype and does not have complete feature parity with open-source SGLang. We have only retained the most critical features and adopted the codebase for faster research iterations.
 
+## Updates
+0517 update distserve codebase [distserve_base](https://github.com/infinigence/Semi-PD/tree/distserve_base)
+
+
 ## Build && Install
 ```shell
 # setup the semi-pd conda environment
