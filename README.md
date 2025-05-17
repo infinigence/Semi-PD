@@ -7,9 +7,8 @@ Semi-PD build from a fork of distserve https://github.com/LLMServe/DistServe.git
 # setup the distserve conda environment
 conda env create -f environment.yml && conda activate distserve
 
-# clone and build alioth
+# build runtime
 cd SwiftTransformer
-git submodule update --init --recursive
 cmake -B build && cmake --build build -j$(nproc)
 cd ..
 
