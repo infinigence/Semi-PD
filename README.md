@@ -7,13 +7,11 @@ A prefill & decode disaggregated LLM serving framework with shared GPU memory an
 ## Paper
 If you use Semi-PD for your research, please cite our [paper](https://arxiv.org/pdf/2504.19867):
 ```
-@misc{hong2025semipd,
+  @article{hong2025semipd,
       title={semi-PD: Towards Efficient LLM Serving via Phase-Wise Disaggregated Computation and Unified Storage},
       author={Ke Hong, Lufang Chen, Zhong Wang, Xiuhong Li, Qiuli Mao, Jianping Ma, Chao Xiong, Guanyu Wu, Buhe Han, Guohao Dai, Yun Liang, Yu Wang},
-      year={2025},
-      eprint={2504.19867},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL}
+      journal={arXiv preprint arXiv:2504.19867},
+      year={2025}
     }
 ```
 
